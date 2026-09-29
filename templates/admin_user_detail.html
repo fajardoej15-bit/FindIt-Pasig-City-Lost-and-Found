@@ -1,1 +1,91 @@
-{% extends "base.html" %}{% block title %}User Details | Pasig City{% endblock %}{% block content %}<div class="page-head"><a href="{{ url_for('admin_users') }}">&larr; User Management</a><div class="profile-header">{% if avatar_url(user) %}<img class="avatar avatar-medium" src="{{ avatar_url(user) }}" alt="Profile picture">{% else %}<div class="avatar avatar-medium">{{ initials(user) }}</div>{% endif %}<div><h1>{{ user['full_name'] or 'User Details' }}</h1><p class="muted">Account information only. Authentication secrets are hidden.</p></div></div></div><section class="panel"><dl><dt>Full name</dt><dd>{{ user['full_name'] or 'Not provided' }}</dd><dt>Email</dt><dd>{{ user['email'] }}</dd><dt>Role</dt><dd>{{ user['role']|upper }}</dd><dt>Status</dt><dd>{{ user['account_status'] or 'ACTIVE' }}</dd><dt>Registered</dt><dd>{{ user['created_at'] or 'Existing account' }}</dd></dl>{% if user['id'] != session['user_id'] %}<form method="post" action="{{ url_for('admin_delete_user',user_id=user['id']) }}" onsubmit="return confirm('Are you sure you want to delete this user?');"><button class="btn danger" type="submit">Delete User</button></form>{% else %}<p class="muted">You cannot delete the administrator account currently in use.</p>{% endif %}</section><section class="panel"><h2>Reports Submitted</h2>{% for report in reports %}<a class="click-row" href="{{ url_for('admin_report_detail',item_id=report['id']) }}"><span>#{{ report['id'] }} {{ report['item_name'] }}</span><span>{{ report['status']|title }}</span></a>{% else %}<div class="empty">No reports submitted.</div>{% endfor %}</section><section class="panel"><h2>Claims Submitted</h2>{% for claim in claims %}<a class="click-row" href="{{ url_for('admin_claim_detail',claim_id=claim['id']) }}"><span>{{ claim_code(claim['id']) }} &middot; {{ claim['item_name'] }}</span><span>{{ claim['status']|title }}</span></a>{% else %}<div class="empty">No claims submitted.</div>{% endfor %}</section>{% endblock %}
+{% extends "base.html" %}
+{% block title %}User Details | Pasig City{% endblock %}
+{% block content %}
+<div class="page-head">
+    <a href="{{ url_for('admin_users') }}">&larr; User Management</a>
+    <div class="profile-header">
+        {% if avatar_url(user) %}
+        <img class="avatar avatar-medium" src="{{ avatar_url(user) }}" alt="Profile picture">
+        {% else %}
+        <div class="avatar avatar-medium">{{ initials(user) }}</div>
+        {% endif %}
+        <div>
+            <h1>{{ user['full_name'] or 'User Details' }}</h1>
+            <p class="muted">Account information only. Authentication secrets are hidden.</p>
+        </div>
+    </div>
+</div>
+
+<section class="panel">
+    <dl>
+        <dt>Full name</dt><dd>{{ user['full_name'] or 'Not provided' }}</dd>
+        <dt>Email</dt><dd>{{ user['email'] }}</dd>
+        <dt>Role</dt><dd>{{ admin_role_label(user) }}</dd>
+        <dt>Status</dt><dd>{{ user['account_status'] or 'ACTIVE' }}</dd>
+        <dt>Account Created</dt><dd>{{ format_account_created(user['created_at']) }}</dd>
+    </dl>
+    {% if can_delete_target %}
+    <form method="post" action="{{ url_for('admin_delete_user', user_id=user['id']) }}" onsubmit="return confirm('Are you sure you want to delete this user?');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <button class="btn danger" type="submit">Delete User</button>
+    </form>
+    {% elif user['id'] == session['user_id'] %}
+    <p class="muted">You cannot delete the administrator account currently in use.</p>
+    {% endif %}
+</section>
+
+{% if can_manage_roles or can_promote_user %}
+<section class="panel">
+    <h2>Role and Permissions</h2>
+    <p>Current Role: <strong>{{ admin_role_label(user) }}</strong></p>
+    {% if can_manage_roles %}
+    <form method="post" action="{{ url_for('admin_change_user_role', user_id=user['id']) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <label for="new-role">Assign role</label>
+        <select id="new-role" name="role" required>
+            <option value="USER"{% if user['role']|upper != 'ADMIN' %} selected{% endif %}>User</option>
+            <option value="RESTRICTED_ADMIN"{% if user['admin_level'] == 'RESTRICTED_ADMIN' %} selected{% endif %}>Restricted Admin</option>
+            <option value="FULL_ADMIN"{% if user['admin_level'] == 'FULL_ADMIN' %} selected{% endif %}>Full Admin</option>
+            <option value="MAIN_ADMIN"{% if user['admin_level'] == 'MAIN_ADMIN' %} selected{% endif %}>Main Admin</option>
+        </select>
+        <fieldset>
+            <legend>Full Admin permissions</legend>
+            <label><input type="checkbox" name="promote_users"{% if user_permissions['promote_users'] %} checked{% endif %}> Promote users to Restricted Admin</label>
+            <label><input type="checkbox" name="delete_users"{% if user_permissions['delete_users'] %} checked{% endif %}> Delete users</label>
+            <small>These permissions apply only when the assigned role is Full Admin.</small>
+        </fieldset>
+        <button class="btn" type="submit">Save Role and Permissions</button>
+    </form>
+    {% else %}
+    <form method="post" action="{{ url_for('admin_change_user_role', user_id=user['id']) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+        <input type="hidden" name="role" value="RESTRICTED_ADMIN">
+        <button class="btn" type="submit">Promote to Restricted Admin</button>
+    </form>
+    {% endif %}
+</section>
+{% endif %}
+
+<section class="panel">
+    <h2>Reports Submitted</h2>
+    {% for report in reports %}
+    <a class="click-row" href="{{ url_for('admin_report_detail', item_id=report['id']) }}">
+        <span>#{{ report['id'] }} {{ report['item_name'] }}</span>
+        <span>{{ report['status']|title }}</span>
+    </a>
+    {% else %}
+    <div class="empty">No reports submitted.</div>
+    {% endfor %}
+</section>
+<section class="panel">
+    <h2>Claims Submitted</h2>
+    {% for claim in claims %}
+    <a class="click-row" href="{{ url_for('admin_claim_detail', claim_id=claim['id']) }}">
+        <span>{{ claim_code(claim['id']) }} &middot; {{ claim['item_name'] }}</span>
+        <span>{{ claim['status']|title }}</span>
+    </a>
+    {% else %}
+    <div class="empty">No claims submitted.</div>
+    {% endfor %}
+</section>
+{% endblock %}

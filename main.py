@@ -68,10 +68,31 @@ def now():
     return datetime.now().isoformat(timespec="seconds")
 
 
+def format_account_created(value):
+    if not value:
+        return "Not available"
+    try:
+        created_at = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return "Not available"
+    hour = created_at.strftime("%I").lstrip("0") or "0"
+    return f"{created_at.strftime('%B')} {created_at.day}, {created_at.year} at {hour}:{created_at.strftime('%M %p')}"
+
+
 OTP_EXPIRY_MINUTES = 10
 OTP_RESEND_COOLDOWN_SECONDS = 60
 OTP_MAX_ATTEMPTS = 5
 OTP_MAX_RESENDS = 5
+RESET_OTP_EXPIRY_MINUTES = 10
+RESET_OTP_RESEND_COOLDOWN_SECONDS = 60
+RESET_OTP_MAX_ATTEMPTS = 5
+RESET_OTP_MAX_RESENDS = 5
+ADMIN_PERMISSION_NAMES = ("promote_users", "delete_users")
+ADMIN_ROLE_LABELS = {
+    "MAIN_ADMIN": "Main Admin",
+    "FULL_ADMIN": "Full Admin",
+    "RESTRICTED_ADMIN": "Restricted Admin",
+}
 
 
 def utc_now():
@@ -109,10 +130,10 @@ def send_otp_email(email, full_name, code):
             "email": sender_email,
         },
         "to": [{"email": email, "name": full_name}],
-        "subject": "SMART Lost & Found - Email Verification",
+        "subject": "FindIt: Pasig City Lost & Found - Email Verification",
         "textContent": (
             f"Hello {full_name},\n\n"
-            f"Your SMART Lost & Found verification code is: {code}\n\n"
+            f"Your FindIt verification code is: {code}\n\n"
             "This code expires in 10 minutes.\n\n"
             "If you did not create this account, you can ignore this email."
         ),
@@ -189,6 +210,66 @@ def is_admin(user=None):
     return bool(user and str(user["role"]).upper() == "ADMIN")
 
 
+def is_main_admin(user=None):
+    return bool(
+        is_admin(user)
+        and str(user["admin_level"] or "").upper() == "MAIN_ADMIN"
+    )
+
+
+def is_full_admin(user=None):
+    return bool(
+        is_admin(user)
+        and str(user["admin_level"] or "").upper() == "FULL_ADMIN"
+    )
+
+
+def admin_role_label(user):
+    if not is_admin(user):
+        return "User"
+    level = str(user["admin_level"] or "RESTRICTED_ADMIN").upper()
+    return ADMIN_ROLE_LABELS.get(level, "Restricted Admin")
+
+
+def admin_permissions(user):
+    if is_main_admin(user):
+        return {permission: True for permission in ADMIN_PERMISSION_NAMES}
+    if not is_full_admin(user):
+        return {permission: False for permission in ADMIN_PERMISSION_NAMES}
+    try:
+        permissions = json.loads(user["admin_permissions"] or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {permission: False for permission in ADMIN_PERMISSION_NAMES}
+    if not isinstance(permissions, dict):
+        return {permission: False for permission in ADMIN_PERMISSION_NAMES}
+    return {
+        permission: permissions.get(permission) is True
+        for permission in ADMIN_PERMISSION_NAMES
+    }
+
+
+def has_admin_permission(user, permission):
+    return permission in ADMIN_PERMISSION_NAMES and admin_permissions(user).get(permission, False)
+
+
+def can_delete_user(actor, target):
+    if not has_admin_permission(actor, "delete_users"):
+        return False
+    return is_main_admin(actor) or not is_admin(target)
+
+
+def admin_csrf_token():
+    if "admin_csrf_token" not in session:
+        session["admin_csrf_token"] = secrets.token_urlsafe(32)
+    return session["admin_csrf_token"]
+
+
+def valid_admin_csrf_token():
+    submitted = request.form.get("csrf_token", "")
+    expected = session.get("admin_csrf_token", "")
+    return bool(expected and submitted and hmac.compare_digest(submitted, expected))
+
+
 def current_user():
     user_id = session.get("user_id")
     if not user_id:
@@ -219,7 +300,11 @@ def admin_required():
     blocked = user_required("Please log in as an administrator to continue.")
     if blocked:
         return blocked
-    if not is_admin(current_user()):
+    user = current_user()
+    if (
+        not is_admin(user)
+        or (user["account_status"] or "ACTIVE") != "ACTIVE"
+    ):
         abort(403)
     return None
 
@@ -479,6 +564,9 @@ def template_context():
         "unread_notifications": unread,
         "unread_messages": unread_messages,
         "claim_code": claim_code,
+        "format_account_created": format_account_created,
+        "admin_role_label": admin_role_label,
+        "is_main_admin": is_main_admin,
         "is_admin": is_admin(user),
         "theme": (user["theme_preference"] if user and user["theme_preference"] in ("light", "dark", "system") else "light") if user else "light"
     }
@@ -531,8 +619,8 @@ def register():
                 }
                 conn.execute(
                     "INSERT INTO users(username,email,password_hash,role,full_name,security_question,security_answer_hash,account_status,created_at,profile_picture) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "PENDING", now(), profile_picture)
+                    "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP,?)",
+                    (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "PENDING", profile_picture)
                 )
                 pending_user["id"] = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 try:
@@ -661,47 +749,226 @@ def logout():
     return redirect(url_for("home"))
 
 
+def reset_recovery_user():
+    user_id = session.get("reset_user_id")
+    if not user_id:
+        return None
+    conn = get_connection()
+    user = conn.execute(
+        "SELECT id,email,full_name,security_question,security_answer_hash "
+        "FROM users WHERE id=? AND account_status='ACTIVE'",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return user
+
+
+def reset_otp_challenge(user_id):
+    conn = get_connection()
+    challenge = conn.execute(
+        "SELECT * FROM password_reset_otps WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return challenge
+
+
+def issue_reset_otp(user):
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    if not send_otp_email(user["email"], user["full_name"] or "there", code):
+        return False
+    sent_at = utc_now()
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO password_reset_otps(user_id,otp_hash,expires_at,attempts,resend_count,last_sent_at) "
+        "VALUES(?,?,?,?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET otp_hash=excluded.otp_hash,"
+        "expires_at=excluded.expires_at,attempts=0,resend_count=0,"
+        "last_sent_at=excluded.last_sent_at",
+        (
+            user["id"],
+            otp_hash(code),
+            (sent_at + timedelta(minutes=RESET_OTP_EXPIRY_MINUTES)).isoformat(),
+            0,
+            0,
+            sent_at.isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def reset_password_form(user):
+    return render_template(
+        "forgot_password.html",
+        set_password_step=True,
+        security_question=user["security_question"],
+    )
+
+
 @app.route("/forgot-password", methods=["GET", "POST"])
 def forgot_password():
-    if request.method == "POST" and request.form.get("email"):
-        email = request.form["email"].strip().lower()
-        conn = get_connection()
-        user = conn.execute("SELECT id,security_question FROM users WHERE lower(email)=? AND account_status='ACTIVE'", (email,)).fetchone()
-        conn.close()
+    if request.method == "POST":
+        if request.form.get("email"):
+            email = request.form["email"].strip().lower()
+            conn = get_connection()
+            user = conn.execute(
+                "SELECT id FROM users WHERE lower(email)=? AND account_status='ACTIVE'",
+                (email,),
+            ).fetchone()
+            conn.close()
+            session.pop("reset_user_id", None)
+            session.pop("reset_method", None)
+            session.pop("reset_verified", None)
+            if user:
+                session["reset_user_id"] = user["id"]
+            return render_template(
+                "forgot_password.html",
+                choose_method_step=True,
+            )
+
+        method = request.form.get("recovery_method")
+        user = reset_recovery_user()
+        if method == "email":
+            session["reset_method"] = "email"
+            if not user or not issue_reset_otp(user):
+                flash("If the account exists, we could not send a recovery code. Please try again later.", "danger")
+                return redirect(url_for("forgot_password"))
+            return redirect(url_for("verify_reset_otp"))
+        if method == "security":
+            session["reset_method"] = "security"
+            if not user or not user["security_question"]:
+                flash("If the account exists, security-question recovery is unavailable. Please try another method.", "danger")
+                return redirect(url_for("forgot_password"))
+            return render_template(
+                "forgot_password.html",
+                security_question=user["security_question"],
+                security_question_step=True,
+            )
+
+    return render_template("forgot_password.html")
+
+
+@app.route("/verify-reset-otp", methods=["GET", "POST"])
+def verify_reset_otp():
+    if session.get("reset_method") != "email":
+        return redirect(url_for("forgot_password"))
+    user = reset_recovery_user()
+    if not user:
         session.pop("reset_user_id", None)
-        if user:
-            session["reset_user_id"] = user["id"]
-            return render_template("forgot_password.html", security_question=user["security_question"] or "Your registered security question", answer_step=True)
-        flash("If that email is registered, you will be able to continue with password recovery.", "info")
-    return render_template("forgot_password.html", answer_step=bool(session.get("reset_user_id")), security_question=None)
+        session.pop("reset_method", None)
+        return redirect(url_for("forgot_password"))
+    challenge = reset_otp_challenge(user["id"])
+    if not challenge:
+        flash("Please request a new recovery code.", "danger")
+        return redirect(url_for("forgot_password"))
+    if request.method == "POST":
+        code = request.form.get("otp", "").strip()
+        if not re.fullmatch(r"\d{6}", code):
+            flash("Invalid recovery code.", "danger")
+        elif parse_utc(challenge["expires_at"]) <= utc_now():
+            flash("The recovery code has expired.", "danger")
+        elif challenge["attempts"] >= RESET_OTP_MAX_ATTEMPTS:
+            flash("Too many attempts. Please request a new recovery code.", "danger")
+        elif not hmac.compare_digest(otp_hash(code), challenge["otp_hash"]):
+            conn = get_connection()
+            attempts = challenge["attempts"] + 1
+            conn.execute(
+                "UPDATE password_reset_otps SET attempts=? WHERE user_id=?",
+                (attempts, user["id"]),
+            )
+            conn.commit()
+            conn.close()
+            flash(
+                "Too many attempts. Please request a new recovery code."
+                if attempts >= RESET_OTP_MAX_ATTEMPTS
+                else "Invalid recovery code.",
+                "danger",
+            )
+        else:
+            conn = get_connection()
+            conn.execute("DELETE FROM password_reset_otps WHERE user_id=?", (user["id"],))
+            conn.commit()
+            conn.close()
+            session["reset_verified"] = True
+            return reset_password_form(user)
+    cooldown = max(
+        0,
+        RESET_OTP_RESEND_COOLDOWN_SECONDS
+        - int((utc_now() - parse_utc(challenge["last_sent_at"])).total_seconds()),
+    )
+    return render_template("forgot_password.html", otp_step=True, cooldown=cooldown)
+
+
+@app.post("/verify-reset-otp/resend")
+def resend_reset_otp():
+    if session.get("reset_method") != "email":
+        return redirect(url_for("forgot_password"))
+    user = reset_recovery_user()
+    if not user:
+        return redirect(url_for("forgot_password"))
+    challenge = reset_otp_challenge(user["id"])
+    if not challenge:
+        flash("Please request a new recovery code.", "danger")
+        return redirect(url_for("forgot_password"))
+    elapsed = (utc_now() - parse_utc(challenge["last_sent_at"])).total_seconds()
+    if elapsed < RESET_OTP_RESEND_COOLDOWN_SECONDS:
+        flash(
+            f"Please wait {RESET_OTP_RESEND_COOLDOWN_SECONDS - int(elapsed)} seconds before requesting another code.",
+            "danger",
+        )
+        return redirect(url_for("verify_reset_otp"))
+    if challenge["resend_count"] >= RESET_OTP_MAX_RESENDS:
+        flash("Too many recovery-code requests. Please try again later.", "danger")
+        return redirect(url_for("verify_reset_otp"))
+    if not issue_reset_otp(user):
+        flash("Unable to send the recovery code. Please try again later.", "danger")
+        return redirect(url_for("verify_reset_otp"))
+    conn = get_connection()
+    conn.execute(
+        "UPDATE password_reset_otps SET resend_count=? WHERE user_id=?",
+        (challenge["resend_count"] + 1, user["id"]),
+    )
+    conn.commit()
+    conn.close()
+    flash("A new recovery code has been sent.", "success")
+    return redirect(url_for("verify_reset_otp"))
 
 
 @app.route("/reset-password", methods=["POST"])
 def reset_password():
-    user_id = session.get("reset_user_id")
-    if not user_id:
+    user = reset_recovery_user()
+    if not user:
         return redirect(url_for("forgot_password"))
-    answer = request.form.get("security_answer", "").strip()
+    if session.get("reset_method") == "security" and not session.get("reset_verified"):
+        answer = request.form.get("security_answer", "").strip()
+        if not AuthController.check_security_answer(answer, user["security_answer_hash"]):
+            flash("The security answer is incorrect.", "danger")
+            return render_template(
+                "forgot_password.html",
+                security_question=user["security_question"],
+                security_question_step=True,
+            )
+        session["reset_verified"] = True
+        return reset_password_form(user)
+    if not session.get("reset_verified"):
+        return redirect(url_for("forgot_password"))
     new_password = request.form.get("new_password", "")
     confirm = request.form.get("confirm_password", "")
-    conn = get_connection()
-    user = conn.execute("SELECT security_answer_hash,security_question FROM users WHERE id=?", (user_id,)).fetchone()
-    if not user or not AuthController.check_security_answer(answer, user["security_answer_hash"]):
-        conn.close()
-        flash("The security answer is incorrect.", "danger")
-        return render_template("forgot_password.html", answer_step=True, security_question=user["security_question"] if user else None)
     if not validate_password(new_password):
-        conn.close()
         flash("Password must be at least 8 characters and include a letter and a number.", "danger")
-        return render_template("forgot_password.html", answer_step=True, security_question=user["security_question"])
+        return reset_password_form(user)
     if new_password != confirm:
-        conn.close()
         flash("Passwords do not match.", "danger")
-        return render_template("forgot_password.html", answer_step=True, security_question=user["security_question"])
-    conn.execute("UPDATE users SET password_hash=? WHERE id=?", (AuthController.password_hash(new_password), user_id))
+        return reset_password_form(user)
+    conn = get_connection()
+    conn.execute("UPDATE users SET password_hash=? WHERE id=?", (AuthController.password_hash(new_password), user["id"]))
     conn.commit()
     conn.close()
     session.pop("reset_user_id", None)
+    session.pop("reset_method", None)
+    session.pop("reset_verified", None)
     flash("Your password has been reset successfully. You can now log in.", "success")
     return redirect(url_for("login"))
 
@@ -1355,7 +1622,14 @@ def admin_dashboard():
         "SELECT items.id,items.item_type,items.item_name,items.location,items.status,users.full_name,users.profile_picture "
         "FROM items JOIN users ON users.id=items.user_id WHERE items.status='PENDING REVIEW' ORDER BY items.id DESC LIMIT 5"
     ).fetchall()
-    users = conn.execute("SELECT id,full_name,email,role,account_status,profile_picture FROM users ORDER BY id DESC LIMIT 5").fetchall()
+    users = conn.execute(
+        "SELECT id,full_name,email,"
+        "CASE WHEN role='admin' THEN CASE admin_level "
+        "WHEN 'MAIN_ADMIN' THEN 'Main Admin' WHEN 'FULL_ADMIN' THEN 'Full Admin' "
+        "ELSE 'Restricted Admin' END ELSE 'User' END AS role,"
+        "admin_level,admin_permissions,account_status,profile_picture "
+        "FROM users ORDER BY id DESC LIMIT 5"
+    ).fetchall()
     admin_notifications = conn.execute(
         "SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 5",
         (session["user_id"],)
@@ -1391,7 +1665,7 @@ def admin_users():
     if (blocked := admin_required()):
         return blocked
     conn = get_connection()
-    users = conn.execute("SELECT id,full_name,email,role,account_status,created_at,profile_picture FROM users ORDER BY id DESC").fetchall()
+    users = conn.execute("SELECT id,full_name,email,role,admin_level,admin_permissions,account_status,created_at,profile_picture FROM users ORDER BY id DESC").fetchall()
     conn.close()
     return render_template("admin_users.html", users=users)
 
@@ -1401,56 +1675,169 @@ def admin_user_detail(user_id):
     if (blocked := admin_required()):
         return blocked
     conn = get_connection()
-    user = conn.execute("SELECT id,full_name,email,role,account_status,created_at,profile_picture FROM users WHERE id=?", (user_id,)).fetchone()
+    user = conn.execute("SELECT id,full_name,email,role,admin_level,admin_permissions,account_status,created_at,profile_picture FROM users WHERE id=?", (user_id,)).fetchone()
     if not user:
         conn.close()
         abort(404)
     reports = conn.execute("SELECT id,item_type,item_name,location,status,item_date FROM items WHERE user_id=? ORDER BY id DESC", (user_id,)).fetchall()
     claims = conn.execute("SELECT claims.id,claims.status,claims.created_at,items.item_name FROM claims JOIN items ON items.id=claims.item_id WHERE claims.claimant_id=? ORDER BY claims.id DESC", (user_id,)).fetchall()
     conn.close()
-    return render_template("admin_user_detail.html", user=user, reports=reports, claims=claims)
+    actor = current_user()
+    return render_template(
+        "admin_user_detail.html",
+        user=user,
+        reports=reports,
+        claims=claims,
+        can_manage_roles=is_main_admin(actor) and actor["id"] != user["id"],
+        can_promote_user=(
+            is_full_admin(actor)
+            and has_admin_permission(actor, "promote_users")
+            and actor["id"] != user["id"]
+            and not is_admin(user)
+        ),
+        can_delete_target=can_delete_user(actor, user) and actor["id"] != user["id"],
+        user_permissions=admin_permissions(user),
+        csrf_token=admin_csrf_token(),
+    )
+
+
+@app.post("/admin/users/<int:user_id>/role")
+def admin_change_user_role(user_id):
+    if (blocked := admin_required()):
+        return blocked
+    if not valid_admin_csrf_token():
+        abort(403)
+
+    new_level = request.form.get("role", "").upper()
+    if new_level not in {"USER", *ADMIN_ROLE_LABELS}:
+        abort(400)
+
+    conn = get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        actor = conn.execute(
+            "SELECT * FROM users WHERE id=?",
+            (session["user_id"],),
+        ).fetchone()
+        target = conn.execute(
+            "SELECT * FROM users WHERE id=?",
+            (user_id,),
+        ).fetchone()
+        if not target:
+            abort(404)
+        if (
+            not is_admin(actor)
+            or (actor["account_status"] or "ACTIVE") != "ACTIVE"
+            or actor["id"] == target["id"]
+        ):
+            abort(403)
+
+        if is_main_admin(actor):
+            main_admin_count = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE role='admin' AND admin_level='MAIN_ADMIN'"
+            ).fetchone()[0]
+            if (
+                is_main_admin(target)
+                and new_level != "MAIN_ADMIN"
+                and main_admin_count <= 1
+            ):
+                abort(409)
+            permissions = {
+                "promote_users": request.form.get("promote_users") == "on",
+                "delete_users": request.form.get("delete_users") == "on",
+            } if new_level == "FULL_ADMIN" else {}
+        elif (
+            is_full_admin(actor)
+            and has_admin_permission(actor, "promote_users")
+            and not is_admin(target)
+            and new_level == "RESTRICTED_ADMIN"
+        ):
+            permissions = {}
+        else:
+            abort(403)
+
+        previous_role = admin_role_label(target)
+        new_role = "admin" if new_level != "USER" else "user"
+        stored_level = None if new_level == "USER" else new_level
+        conn.execute(
+            "UPDATE users SET role=?,admin_level=?,admin_permissions=? WHERE id=?",
+            (new_role, stored_level, json.dumps(permissions, sort_keys=True), user_id),
+        )
+        conn.execute(
+            "INSERT INTO audit_logs(user_id,action,details) VALUES(?,?,?)",
+            (
+                actor["id"],
+                "ADMIN_ROLE_CHANGED",
+                f"Changed user #{user_id} ({target['email']}) from {previous_role} "
+                f"to {admin_role_label({'role': new_role, 'admin_level': stored_level})}. "
+                f"Permissions: {json.dumps(permissions, sort_keys=True)}.",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    session["admin_csrf_token"] = secrets.token_urlsafe(32)
+    flash(f"{target['full_name'] or target['email']}'s role is now {admin_role_label({'role': new_role, 'admin_level': stored_level})}.", "success")
+    return redirect(url_for("admin_user_detail", user_id=user_id))
 
 
 @app.post("/admin/users/<int:user_id>/delete")
 def admin_delete_user(user_id):
     if (blocked := admin_required()):
         return blocked
-    if user_id == session["user_id"]:
-        flash("You cannot delete the administrator account you are currently using.", "danger")
-        return redirect(url_for("admin_user_detail", user_id=user_id))
+    if not valid_admin_csrf_token():
+        abort(403)
 
     conn = get_connection()
-    user = conn.execute(
-        "SELECT id,full_name,email,profile_picture FROM users WHERE id=?",
-        (user_id,),
-    ).fetchone()
-    if not user:
-        conn.close()
-        abort(404)
-
-    report_files = [
-        row["image_filename"]
-        for row in conn.execute(
-            "SELECT image_filename FROM items WHERE user_id=? AND image_filename IS NOT NULL",
-            (user_id,),
-        ).fetchall()
-    ]
-    claim_files = [
-        filename
-        for row in conn.execute(
-            "SELECT proof_filename,id_filename FROM claims "
-            "WHERE claimant_id=? OR item_id IN (SELECT id FROM items WHERE user_id=?)",
-            (user_id, user_id),
-        ).fetchall()
-        for filename in (row["proof_filename"], row["id_filename"])
-        if filename
-    ]
-    item_filter = "(SELECT id FROM items WHERE user_id=?)"
-    claim_filter = (
-        "(SELECT id FROM claims WHERE claimant_id=? "
-        "OR item_id IN (SELECT id FROM items WHERE user_id=?))"
-    )
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        actor = conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
+        user = conn.execute(
+            "SELECT id,full_name,email,profile_picture,role,admin_level "
+            "FROM users WHERE id=?",
+            (user_id,),
+        ).fetchone()
+        if (
+            not is_admin(actor)
+            or (actor["account_status"] or "ACTIVE") != "ACTIVE"
+        ):
+            abort(403)
+        if not user:
+            abort(404)
+        if user_id == actor["id"]:
+            abort(403)
+        if not can_delete_user(actor, user):
+            abort(403)
+        if is_main_admin(user):
+            main_admin_count = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE role='admin' AND admin_level='MAIN_ADMIN'"
+            ).fetchone()[0]
+            if main_admin_count <= 1:
+                abort(409)
+
+        report_files = [
+            row["image_filename"]
+            for row in conn.execute(
+                "SELECT image_filename FROM items WHERE user_id=? AND image_filename IS NOT NULL",
+                (user_id,),
+            ).fetchall()
+        ]
+        claim_files = [
+            filename
+            for row in conn.execute(
+                "SELECT proof_filename,id_filename FROM claims "
+                "WHERE claimant_id=? OR item_id IN (SELECT id FROM items WHERE user_id=?)",
+                (user_id, user_id),
+            ).fetchall()
+            for filename in (row["proof_filename"], row["id_filename"])
+            if filename
+        ]
+        item_filter = "(SELECT id FROM items WHERE user_id=?)"
+        claim_filter = (
+            "(SELECT id FROM claims WHERE claimant_id=? "
+            "OR item_id IN (SELECT id FROM items WHERE user_id=?))"
+        )
         conn.execute(
             "DELETE FROM messages WHERE sender_id=? OR recipient_id=? "
             f"OR item_id IN {item_filter} OR claim_id IN {claim_filter}",
@@ -1476,10 +1863,10 @@ def admin_delete_user(user_id):
         conn.commit()
     except sqlite3.IntegrityError:
         conn.rollback()
-        conn.close()
         flash("The user could not be deleted because related records are still in use.", "danger")
         return redirect(url_for("admin_user_detail", user_id=user_id))
-    conn.close()
+    finally:
+        conn.close()
 
     delete_avatar(user["profile_picture"])
     for filename in report_files + claim_files:
@@ -1842,5 +2229,5 @@ def server_error(error):
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 5000))
-    print(f"SMART LOST & FOUND PORTAL - PASIG CITY: http://0.0.0.0:{port}")
+    print(f"FindIt: Pasig City Lost & Found: http://0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)

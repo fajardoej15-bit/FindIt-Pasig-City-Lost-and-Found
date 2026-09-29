@@ -1,8 +1,8 @@
-# Smart Lost & Found Portal – Pasig City
+# FindIt: Pasig City Lost & Found
 
 ## Project Title & Problem Statement
 
-**Smart Lost & Found Portal – Pasig City**
+** FindIt: Pasig City Lost & Found **
 
 A web-based lost and found management system designed to help Pasig City residents report lost and found items, search for possible matches, submit claim requests, provide ownership evidence, and communicate with authorized administrators.
 
@@ -33,7 +33,7 @@ The system aims to organize the lost-and-found process in a centralized platform
   * Supports the implementation and refinement of the application's user interface.
   * Coordinates with the lead developer during system development.
 
-* **Quality Assurance / System Checker:** Fajardo Eduardo
+* **Quality Assurance / System Checker:** Fajardo/Jose
 
   * Checks system functionality and user workflows.
   * Tests features to identify errors and unexpected behavior.
@@ -59,11 +59,10 @@ The system aims to organize the lost-and-found process in a centralized platform
 
 * **Progress Report Documentation:** Jhayson Vidal
 
-* Prepares and maintains documentation of the team's development progress.
-* Records completed tasks, ongoing activities, and development milestones.
-* Documents updates and improvements made to the system throughout the development process.
-* Assists in preparing progress reports for project monitoring and presentation.
-* Coordinates with the development team to ensure that progress reports accurately reflect the current status of the system.
+  * Prepares and maintains documentation of the team's development progress.
+  * Documents updates and improvements made to the system throughout the development process.
+  * Assists in preparing progress reports for project monitoring and presentation.
+
 
 ## Key System Features
 

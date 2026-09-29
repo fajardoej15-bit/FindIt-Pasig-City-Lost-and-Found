@@ -14,15 +14,47 @@ body {
 
 .navbar {
   min-height: 78px;
-  padding: 0 max(5%, calc((100% - 1220px) / 2));
+  padding: 0 max(6%, calc((100% - 1220px) / 2));
   background: rgba(7, 65, 61, .97);
   box-shadow: 0 4px 18px rgba(7, 65, 61, .12);
+}
+
+.brand {
+  transform: translateY(4px);
 }
 
 .brand-mark {
   background: linear-gradient(135deg, #2bbf91, #0c82a4);
   border-radius: 12px;
   box-shadow: 0 5px 14px rgba(43, 191, 145, .25);
+}
+
+.brand-logo {
+  width: 62px;
+  height: 62px;
+  flex: 0 0 62px;
+  object-fit: contain;
+}
+
+.brand-copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.brand-copy strong {
+  color: #fff;
+  font-size: 19px;
+  line-height: 1.1;
+}
+
+.brand-copy small {
+  display: block;
+  color: #b8d4e8;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
 }
 
 .nav-links a:hover,
@@ -571,6 +603,7 @@ body {
 .footer-links a:hover { color: white; }
 
 @media (max-width: 850px) {
+  .navbar { padding-right: 6%; padding-left: 6%; }
   .home-hero { grid-template-columns: 1fr; padding-top: 55px; }
   .hero-copy { max-width: 700px; }
   .story-visual { width: min(100%, 560px); }
