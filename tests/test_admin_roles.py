@@ -404,12 +404,13 @@ class AdminRoleTests(unittest.TestCase):
                 os.environ,
                 {
                     "MAIL_USERNAME": "sender@gmail.com",
-                    "MAIL_PASSWORD": "test-app-password",
+                    "RESEND_API_KEY": "test-resend-key",
                 },
             ),
-            patch.object(self.main.smtplib, "SMTP") as smtp_factory,
+            patch.object(self.main.urllib.request, "urlopen") as urlopen,
             patch.object(self.main.secrets, "randbelow", return_value=123456),
         ):
+            urlopen.return_value.__enter__.return_value.status = 200
             response = self.client.post(
                 "/register",
                 data={
@@ -424,21 +425,23 @@ class AdminRoleTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 302)
         self.assertTrue(response.location.endswith("/verify-otp"))
-        smtp_factory.assert_called_once_with("smtp.gmail.com", 587, timeout=20)
-        smtp = smtp_factory.return_value.__enter__.return_value
-        smtp.starttls.assert_called_once_with()
-        smtp.login.assert_called_once_with("sender@gmail.com", "test-app-password")
-        message = smtp.send_message.call_args.args[0]
+        urlopen.assert_called_once()
+        api_request = urlopen.call_args.args[0]
+        self.assertEqual(api_request.full_url, "https://api.resend.com/emails")
+        self.assertEqual(api_request.get_method(), "POST")
+        self.assertEqual(api_request.get_header("Authorization"), "Bearer test-resend-key")
+        self.assertEqual(urlopen.call_args.kwargs, {"timeout": 20})
+        payload = json.loads(api_request.data)
         self.assertEqual(
-            message["From"],
+            payload["from"],
             '"FindIt: Pasig City Lost & Found" <sender@gmail.com>',
         )
-        self.assertEqual(message["To"], email)
+        self.assertEqual(payload["to"], [email])
         self.assertEqual(
-            message["Subject"],
+            payload["subject"],
             "FindIt: Pasig City Lost & Found - Email Verification",
         )
-        self.assertIn("123456", message.get_content())
+        self.assertIn("123456", payload["text"])
         user = self.account(email)
         self.assertEqual(user["account_status"], "PENDING")
         conn = database.get_connection()

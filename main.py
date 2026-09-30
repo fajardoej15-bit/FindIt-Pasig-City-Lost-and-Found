@@ -7,8 +7,8 @@ import json
 import os
 import re
 import secrets
-import smtplib
-from email.message import EmailMessage
+import urllib.error
+import urllib.request
 from email.utils import formataddr
 
 from flask import Flask, abort, flash, redirect, render_template, request, send_from_directory, session, url_for
@@ -130,17 +130,15 @@ def otp_hash(code):
 
 
 def send_otp_email(email, full_name, code):
-    mail_username = os.getenv("MAIL_USERNAME", "").strip()
-    mail_password = os.getenv("MAIL_PASSWORD", "").strip()
-    if not mail_username or not mail_password:
-        app.logger.error("Gmail SMTP configuration missing: MAIL_USERNAME or MAIL_PASSWORD is not set.")
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    sender = os.getenv("MAIL_USERNAME", "").strip()
+    if not api_key or not sender:
+        app.logger.error(
+            "Resend email configuration missing: RESEND_API_KEY or sender is not set."
+        )
         return False
 
-    message = EmailMessage()
-    message["From"] = formataddr(("FindIt: Pasig City Lost & Found", mail_username))
-    message["To"] = email
-    message["Subject"] = "FindIt: Pasig City Lost & Found - Email Verification"
-    message.set_content(
+    body = (
         f"Hello {full_name},\n\n"
         "Thank you for registering with FindIt: Pasig City Lost & Found.\n\n"
         f"Your verification code is:\n\n{code}\n\n"
@@ -148,32 +146,47 @@ def send_otp_email(email, full_name, code):
         "If you did not create this account, you can ignore this email.\n\n"
         "Thank you,\nFindIt: Pasig City Lost & Found"
     )
-
-    stage = "connection"
+    payload = {
+        "from": formataddr(("FindIt: Pasig City Lost & Found", sender)),
+        "to": [email],
+        "subject": "FindIt: Pasig City Lost & Found - Email Verification",
+        "text": body,
+    }
+    api_request = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    stage = "HTTPS request"
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as smtp:
-            stage = "STARTTLS"
-            smtp.starttls()
-            stage = "authentication"
-            smtp.login(mail_username, mail_password)
-            stage = "sending"
-            smtp.send_message(message)
-        return True
-    except (OSError, smtplib.SMTPException, ValueError) as exc:
-        if isinstance(exc, OSError):
-            errno = exc.errno if isinstance(exc.errno, int) else None
-            app.logger.error(
-                "Gmail SMTP %s failed: type=%s errno=%s",
-                stage,
-                type(exc).__name__,
-                errno,
-            )
-        else:
-            app.logger.error(
-                "Gmail SMTP %s failed: type=%s",
-                stage,
-                type(exc).__name__,
-            )
+        with urllib.request.urlopen(api_request, timeout=20) as response:
+            status = response.status
+        if 200 <= status < 300:
+            return True
+        app.logger.error(
+            "Resend email submission failed: stage=HTTP response "
+            "type=HTTPError http_status=%s",
+            status,
+        )
+        return False
+    except urllib.error.HTTPError as exc:
+        app.logger.error(
+            "Resend email submission failed: stage=%s type=%s http_status=%s",
+            stage,
+            type(exc).__name__,
+            exc.code if isinstance(exc.code, int) else None,
+        )
+        return False
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        app.logger.error(
+            "Resend email submission failed: stage=%s type=%s",
+            stage,
+            type(exc).__name__,
+        )
         return False
 
 
