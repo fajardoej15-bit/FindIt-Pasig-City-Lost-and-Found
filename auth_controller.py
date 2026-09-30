@@ -1,17 +1,22 @@
 import hashlib
-import sqlite3
+
+from database import get_connection
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
 class AuthController:
-    def __init__(self, db_path="lost_found.db"):
+    def __init__(self, db_path=None):
         self.db_path = db_path
 
     def login(self, email, password):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        user = conn.execute("SELECT * FROM users WHERE lower(email)=lower(?)", (email,)).fetchone()
-        conn.close()
+        conn = get_connection(sqlite_path=self.db_path)
+        try:
+            user = conn.execute(
+                "SELECT * FROM users WHERE lower(email)=lower(?)",
+                (email,),
+            ).fetchone()
+        finally:
+            conn.close()
         valid = False
         if user:
             valid = check_password_hash(user["password_hash"], password) or user["password_hash"] == hashlib.sha256(password.encode()).hexdigest()

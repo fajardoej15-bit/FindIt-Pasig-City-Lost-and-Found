@@ -1,104 +1,293 @@
 from pathlib import Path
+import os
+import re
 import sqlite3
 
+import psycopg
+
+
 DB_NAME = str(Path(__file__).resolve().parent / "lost_found.db")
+_SCHEMA_LOCK_ID = 745219083
+_ADMIN_LOCK_ID = 745219084
+INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
 
 
-def get_connection():
-    conn = sqlite3.connect(DB_NAME)
+class HybridRow(dict):
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return tuple(self.values())[key]
+        return super().__getitem__(key)
+
+
+class PostgresCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    def execute(self, query, parameters=None):
+        query = _qmark_to_format(query)
+        if parameters is None:
+            self._cursor.execute(query)
+        else:
+            self._cursor.execute(query, parameters)
+        return self
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class PostgresConnection:
+    backend = "postgres"
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, query, parameters=None):
+        return self.cursor().execute(query, parameters)
+
+    def cursor(self):
+        return PostgresCursor(self._connection.cursor())
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+def _qmark_to_format(query):
+    """Translate SQLite-style placeholders without altering quoted SQL text."""
+    result = []
+    index = 0
+    quote = None
+    while index < len(query):
+        char = query[index]
+        if quote:
+            result.append(char)
+            if char == quote:
+                if index + 1 < len(query) and query[index + 1] == quote:
+                    result.append(query[index + 1])
+                    index += 1
+                else:
+                    quote = None
+        elif char in ("'", '"'):
+            quote = char
+            result.append(char)
+        elif char == "-" and query[index:index + 2] == "--":
+            end = query.find("\n", index)
+            if end == -1:
+                result.append(query[index:])
+                break
+            result.append(query[index:end + 1])
+            index = end
+        elif char == "/" and query[index:index + 2] == "/*":
+            end = query.find("*/", index + 2)
+            if end == -1:
+                result.append(query[index:])
+                break
+            result.append(query[index:end + 2])
+            index = end + 1
+        else:
+            result.append("%s" if char == "?" else char)
+        index += 1
+    return "".join(result)
+
+
+def backend_for_url(database_url=None):
+    if database_url is None:
+        database_url = os.environ.get("DATABASE_URL")
+    return "postgres" if database_url else "sqlite"
+
+
+def is_postgres(conn):
+    return getattr(conn, "backend", "sqlite") == "postgres"
+
+
+def get_connection(sqlite_path=None):
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        if database_url.startswith("postgres://"):
+            database_url = "postgresql://" + database_url[len("postgres://"):]
+        return PostgresConnection(
+            psycopg.connect(database_url, row_factory=_hybrid_row_factory)
+        )
+
+    conn = sqlite3.connect(sqlite_path or DB_NAME)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
-def add_column(cursor, table, column, definition):
-    columns = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
-        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+def _hybrid_row_factory(cursor):
+    if cursor.description is None:
+        def no_result(values):
+            raise psycopg.InterfaceError("the cursor doesn't have a result")
+
+        return no_result
+
+    column_names = [column.name for column in cursor.description]
+
+    def make_row(values):
+        return HybridRow(zip(column_names, values))
+
+    return make_row
+
+
+def insert_returning_id(conn, query, parameters=()):
+    if is_postgres(conn):
+        return conn.execute(f"{query.rstrip().rstrip(';')} RETURNING id", parameters).fetchone()["id"]
+    return conn.execute(query, parameters).lastrowid
+
+
+def begin_admin_transaction(conn):
+    if is_postgres(conn):
+        conn.execute("SELECT pg_advisory_xact_lock(?)", (_ADMIN_LOCK_ID,))
+    else:
+        conn.execute("BEGIN IMMEDIATE")
+
+
+def add_column(conn, table, column, definition):
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", table):
+        raise ValueError(f"Invalid table name: {table}")
+    if not re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", column):
+        raise ValueError(f"Invalid column name: {column}")
+
+    if is_postgres(conn):
+        exists = conn.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema=current_schema() AND table_name=? AND column_name=?",
+            (table, column),
+        ).fetchone()
+    else:
+        exists = any(
+            row["name"] == column
+            for row in conn.execute(f'PRAGMA table_info("{table}")')
+        )
+    if not exists:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def _adapt_schema_statement(statement, postgres):
+    id_definition = (
+        "BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"
+        if postgres
+        else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    )
+    statement = statement.replace(
+        "INTEGER PRIMARY KEY AUTOINCREMENT", id_definition
+    )
+    if postgres:
+        statement = re.sub(
+            r"\b(user_id|item_id|claimant_id|lost_item_id|found_item_id|"
+            r"sender_id|recipient_id|claim_id) INTEGER\b",
+            r"\1 BIGINT",
+            statement,
+        )
+        statement = statement.replace(
+            "DEFAULT CURRENT_TIMESTAMP",
+            "DEFAULT (CURRENT_TIMESTAMP::text)",
+        )
+        statement = statement.replace(
+            "{match_foreign_keys}",
+            ", FOREIGN KEY(lost_item_id) REFERENCES items(id), "
+            "FOREIGN KEY(found_item_id) REFERENCES items(id)",
+        )
+    else:
+        statement = statement.replace("{match_foreign_keys}", "")
+    return statement
 
 
 def init_db():
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', full_name TEXT, student_id TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)")
-    users_columns = {row[1] for row in cursor.execute("PRAGMA table_info(users)")}
-    cursor.execute("CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, item_type TEXT NOT NULL, item_name TEXT NOT NULL, category TEXT NOT NULL, location TEXT NOT NULL, item_date TEXT NOT NULL, item_time TEXT, color TEXT, description TEXT, status TEXT NOT NULL DEFAULT 'ACTIVE', created_at TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id))")
-    cursor.execute("CREATE TABLE IF NOT EXISTS claims (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, claimant_id INTEGER NOT NULL, proof TEXT, status TEXT NOT NULL DEFAULT 'PENDING', admin_notes TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, reviewed_at TEXT, FOREIGN KEY(item_id) REFERENCES items(id), FOREIGN KEY(claimant_id) REFERENCES users(id))")
-    cursor.execute("CREATE TABLE IF NOT EXISTS matches (id INTEGER PRIMARY KEY AUTOINCREMENT, lost_item_id INTEGER NOT NULL, found_item_id INTEGER NOT NULL, score INTEGER NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(lost_item_id, found_item_id))")
-    cursor.execute("CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, action TEXT NOT NULL, details TEXT, timestamp TEXT DEFAULT CURRENT_TIMESTAMP)")
-    cursor.execute("CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id INTEGER NOT NULL, recipient_id INTEGER, item_id INTEGER, claim_id INTEGER, body TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, read_at TEXT, FOREIGN KEY(sender_id) REFERENCES users(id), FOREIGN KEY(recipient_id) REFERENCES users(id), FOREIGN KEY(item_id) REFERENCES items(id), FOREIGN KEY(claim_id) REFERENCES claims(id))")
-    cursor.execute("CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, claim_id INTEGER, item_id INTEGER, message TEXT NOT NULL, notification_type TEXT NOT NULL DEFAULT 'INFO', is_read INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id), FOREIGN KEY(claim_id) REFERENCES claims(id), FOREIGN KEY(item_id) REFERENCES items(id))")
-    cursor.execute(
-        "CREATE TABLE IF NOT EXISTS otp_verifications ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, "
-        "otp_hash TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
-        "resend_count INTEGER NOT NULL DEFAULT 0, last_sent_at TEXT NOT NULL, "
-        "FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"
-    )
-    cursor.execute(
-        "CREATE TABLE IF NOT EXISTS password_reset_otps ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, "
-        "otp_hash TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, "
-        "resend_count INTEGER NOT NULL DEFAULT 0, last_sent_at TEXT NOT NULL, "
-        "FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)"
-    )
+    try:
+        if is_postgres(conn):
+            conn.execute("SELECT pg_advisory_xact_lock(?)", (_SCHEMA_LOCK_ID,))
 
-    add_column(cursor, "users", "full_name", "TEXT")
-    add_column(cursor, "users", "student_id", "TEXT")
-    add_column(cursor, "users", "security_question", "TEXT")
-    add_column(cursor, "users", "security_answer_hash", "TEXT")
-    add_column(cursor, "users", "account_status", "TEXT DEFAULT 'ACTIVE'")
-    add_column(cursor, "users", "created_at", "TEXT")
-    add_column(cursor, "users", "profile_picture", "TEXT")
-    add_column(cursor, "users", "theme_preference", "TEXT DEFAULT 'light'")
-    add_column(cursor, "users", "admin_level", "TEXT")
-    add_column(cursor, "users", "admin_permissions", "TEXT NOT NULL DEFAULT '{}'")
-    add_column(cursor, "items", "additional_details", "TEXT")
-    add_column(cursor, "items", "contact_info", "TEXT")
-    add_column(cursor, "items", "image_filename", "TEXT")
-    add_column(cursor, "items", "specific_location", "TEXT")
-    add_column(cursor, "items", "review_notes", "TEXT")
-    add_column(cursor, "items", "updated_at", "TEXT")
-    add_column(cursor, "claims", "reason", "TEXT")
-    add_column(cursor, "claims", "proof_filename", "TEXT")
-    add_column(cursor, "claims", "id_filename", "TEXT")
-    add_column(cursor, "claims", "updated_at", "TEXT")
-    add_column(cursor, "claims", "release_barangay", "TEXT")
-    add_column(cursor, "claims", "release_location", "TEXT")
-    add_column(cursor, "claims", "release_instructions", "TEXT")
-    add_column(cursor, "claims", "required_documents", "TEXT")
-    add_column(cursor, "claims", "coordination_contact", "TEXT")
-    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(lower(email))")
-    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_student_id ON users(student_id) WHERE student_id IS NOT NULL")
-    cursor.execute("UPDATE users SET role='admin' WHERE upper(role) IN ('ADMIN','MAIN_ADMIN','FULL_ADMIN','RESTRICTED_ADMIN')")
-    cursor.execute("UPDATE users SET role='user' WHERE upper(role) IN ('STUDENT','USER')")
-    cursor.execute(
-        "UPDATE users SET admin_level='RESTRICTED_ADMIN' "
-        "WHERE role='admin' AND (admin_level IS NULL OR admin_level NOT IN ('MAIN_ADMIN','FULL_ADMIN','RESTRICTED_ADMIN'))"
-    )
-    cursor.execute("UPDATE users SET admin_level=NULL,admin_permissions='{}' WHERE role!='admin'")
-    cursor.execute(
-        "UPDATE users SET admin_permissions='{}' "
-        "WHERE admin_permissions IS NULL OR trim(admin_permissions)=''"
-    )
-    cursor.execute("UPDATE users SET account_status='ACTIVE' WHERE account_status IS NULL")
-    cursor.execute("UPDATE users SET theme_preference='light' WHERE theme_preference IS NULL OR theme_preference NOT IN ('light','dark','system')")
+        statements = [
+            "CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', full_name TEXT, student_id TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, item_type TEXT NOT NULL, item_name TEXT NOT NULL, category TEXT NOT NULL, location TEXT NOT NULL, item_date TEXT NOT NULL, item_time TEXT, color TEXT, description TEXT, status TEXT NOT NULL DEFAULT 'ACTIVE', created_at TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id))",
+            "CREATE TABLE IF NOT EXISTS claims (id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, claimant_id INTEGER NOT NULL, proof TEXT, status TEXT NOT NULL DEFAULT 'PENDING', admin_notes TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, reviewed_at TEXT, FOREIGN KEY(item_id) REFERENCES items(id), FOREIGN KEY(claimant_id) REFERENCES users(id))",
+            "CREATE TABLE IF NOT EXISTS matches (id INTEGER PRIMARY KEY AUTOINCREMENT, lost_item_id INTEGER NOT NULL, found_item_id INTEGER NOT NULL, score INTEGER NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(lost_item_id, found_item_id){match_foreign_keys})",
+            "CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, action TEXT NOT NULL, details TEXT, timestamp TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id))",
+            "CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender_id INTEGER NOT NULL, recipient_id INTEGER, item_id INTEGER, claim_id INTEGER, body TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, read_at TEXT, FOREIGN KEY(sender_id) REFERENCES users(id), FOREIGN KEY(recipient_id) REFERENCES users(id), FOREIGN KEY(item_id) REFERENCES items(id), FOREIGN KEY(claim_id) REFERENCES claims(id))",
+            "CREATE TABLE IF NOT EXISTS notifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, claim_id INTEGER, item_id INTEGER, message TEXT NOT NULL, notification_type TEXT NOT NULL DEFAULT 'INFO', is_read INTEGER NOT NULL DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(user_id) REFERENCES users(id), FOREIGN KEY(claim_id) REFERENCES claims(id), FOREIGN KEY(item_id) REFERENCES items(id))",
+            "CREATE TABLE IF NOT EXISTS otp_verifications (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, otp_hash TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, resend_count INTEGER NOT NULL DEFAULT 0, last_sent_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)",
+            "CREATE TABLE IF NOT EXISTS password_reset_otps (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL UNIQUE, otp_hash TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, resend_count INTEGER NOT NULL DEFAULT 0, last_sent_at TEXT NOT NULL, FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE)",
+        ]
+        for statement in statements:
+            conn.execute(_adapt_schema_statement(statement, is_postgres(conn)))
 
-    if "admin_level" not in users_columns:
-        legacy_admins = cursor.execute(
-            "SELECT id FROM users WHERE role='admin' ORDER BY id"
-        ).fetchall()
-        if legacy_admins:
-            cursor.execute(
-                "UPDATE users SET admin_level='RESTRICTED_ADMIN' WHERE role='admin'"
+        users_columns = {
+            row["column_name"] if is_postgres(conn) else row["name"]
+            for row in (
+                conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema=current_schema() AND table_name='users'"
+                ).fetchall()
+                if is_postgres(conn)
+                else conn.execute('PRAGMA table_info("users")').fetchall()
             )
-            cursor.execute(
-                "UPDATE users SET admin_level='MAIN_ADMIN' WHERE id=?",
-                (legacy_admins[0]["id"],),
-            )
+        }
+        for table, column, definition in (
+            ("users", "full_name", "TEXT"),
+            ("users", "student_id", "TEXT"),
+            ("users", "security_question", "TEXT"),
+            ("users", "security_answer_hash", "TEXT"),
+            ("users", "account_status", "TEXT DEFAULT 'ACTIVE'"),
+            ("users", "created_at", "TEXT"),
+            ("users", "profile_picture", "TEXT"),
+            ("users", "theme_preference", "TEXT DEFAULT 'light'"),
+            ("users", "admin_level", "TEXT"),
+            ("users", "admin_permissions", "TEXT NOT NULL DEFAULT '{}'"),
+            ("items", "additional_details", "TEXT"),
+            ("items", "contact_info", "TEXT"),
+            ("items", "image_filename", "TEXT"),
+            ("items", "specific_location", "TEXT"),
+            ("items", "review_notes", "TEXT"),
+            ("items", "updated_at", "TEXT"),
+            ("claims", "reason", "TEXT"),
+            ("claims", "proof_filename", "TEXT"),
+            ("claims", "id_filename", "TEXT"),
+            ("claims", "updated_at", "TEXT"),
+            ("claims", "release_barangay", "TEXT"),
+            ("claims", "release_location", "TEXT"),
+            ("claims", "release_instructions", "TEXT"),
+            ("claims", "required_documents", "TEXT"),
+            ("claims", "coordination_contact", "TEXT"),
+        ):
+            add_column(conn, table, column, definition)
 
-    conn.commit()
-    conn.close()
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(lower(email))")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_student_id ON users(student_id) WHERE student_id IS NOT NULL")
+        conn.execute("UPDATE users SET role='admin' WHERE upper(role) IN ('ADMIN','MAIN_ADMIN','FULL_ADMIN','RESTRICTED_ADMIN')")
+        conn.execute("UPDATE users SET role='user' WHERE upper(role) IN ('STUDENT','USER')")
+        conn.execute(
+            "UPDATE users SET admin_level='RESTRICTED_ADMIN' "
+            "WHERE role='admin' AND (admin_level IS NULL OR admin_level NOT IN ('MAIN_ADMIN','FULL_ADMIN','RESTRICTED_ADMIN'))"
+        )
+        conn.execute("UPDATE users SET admin_level=NULL,admin_permissions='{}' WHERE role!='admin'")
+        conn.execute(
+            "UPDATE users SET admin_permissions='{}' "
+            "WHERE admin_permissions IS NULL OR trim(admin_permissions)=''"
+        )
+        conn.execute("UPDATE users SET account_status='ACTIVE' WHERE account_status IS NULL")
+        conn.execute("UPDATE users SET theme_preference='light' WHERE theme_preference IS NULL OR theme_preference NOT IN ('light','dark','system')")
+
+        if "admin_level" not in users_columns:
+            legacy_admins = conn.execute(
+                "SELECT id FROM users WHERE role='admin' ORDER BY id"
+            ).fetchall()
+            if legacy_admins:
+                conn.execute(
+                    "UPDATE users SET admin_level='RESTRICTED_ADMIN' WHERE role='admin'"
+                )
+                conn.execute(
+                    "UPDATE users SET admin_level='MAIN_ADMIN' WHERE id=?",
+                    (legacy_admins[0]["id"],),
+                )
+
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

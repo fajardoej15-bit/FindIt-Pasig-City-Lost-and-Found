@@ -7,7 +7,6 @@ import json
 import os
 import re
 import secrets
-import sqlite3
 import smtplib
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -17,7 +16,13 @@ from PIL import Image, UnidentifiedImageError
 from werkzeug.utils import secure_filename
 
 from auth_controller import AuthController
-from database import get_connection, init_db
+from database import (
+    begin_admin_transaction,
+    get_connection,
+    init_db,
+    INTEGRITY_ERRORS,
+    insert_returning_id,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 PUBLIC_UPLOAD_DIR = BASE_DIR / "static" / "uploads"
@@ -28,10 +33,22 @@ PRIVATE_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 AVATAR_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__, template_folder=str(BASE_DIR / "templates"), static_folder=str(BASE_DIR / "static"))
+def configured_secret_key():
+    secret_key = os.environ.get("SECRET_KEY")
+    if secret_key:
+        return secret_key
+    if (
+        os.environ.get("FLASK_DEBUG", "False").lower() == "true"
+        and not os.environ.get("DATABASE_URL")
+    ):
+        return secrets.token_hex(32)
+    raise RuntimeError("SECRET_KEY must be set when FLASK_DEBUG is disabled.")
+
+
 app.config.update(
     DEBUG=os.environ.get("FLASK_DEBUG", "False").lower() == "true",
     TESTING=False,
-    SECRET_KEY=os.environ.get("SECRET_KEY", "smart-lost-found-portal-development-key"),
+    SECRET_KEY=configured_secret_key(),
     MAX_CONTENT_LENGTH=5 * 1024 * 1024,
     ALLOWED_EXTENSIONS={"png", "jpg", "jpeg", "gif", "webp", "pdf"},
     AVATAR_EXTENSIONS={"png", "jpg", "jpeg"},
@@ -584,12 +601,12 @@ def register():
                     "email": email,
                     "full_name": full_name,
                 }
-                conn.execute(
+                pending_user["id"] = insert_returning_id(
+                    conn,
                     "INSERT INTO users(username,email,password_hash,role,full_name,security_question,security_answer_hash,account_status,created_at,profile_picture) "
-                    "VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,?)",
-                    (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "PENDING", profile_picture)
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "PENDING", now(), profile_picture),
                 )
-                pending_user["id"] = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 try:
                     if not issue_otp(conn, pending_user):
                         raise RuntimeError("Unable to send the verification email. Please try again later.")
@@ -611,7 +628,7 @@ def register():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        success, result = AuthController(str(BASE_DIR / "lost_found.db")).login(request.form.get("email", "").strip(), request.form.get("password", ""))
+        success, result = AuthController().login(request.form.get("email", "").strip(), request.form.get("password", ""))
         if success:
             session.clear()
             session.update(user_id=result["id"], email=result["email"], role=result["role"])
@@ -1036,12 +1053,12 @@ def save_report(report_type, item_id=None):
     conn = get_connection()
     timestamp = now()
     if item_id is None:
-        cur = conn.execute(
+        item_id = insert_returning_id(
+            conn,
             "INSERT INTO items(user_id,item_type,item_name,category,location,specific_location,item_date,item_time,description,status,additional_details,image_filename,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (session["user_id"], report_type, data["item_name"], data["category"], data["barangay"], data["specific_location"], data["item_date"], data["item_time"], data["description"], "PENDING REVIEW", data["additional_details"], image, timestamp)
         )
-        item_id = cur.lastrowid
         log_action(conn, "SUBMIT_REPORT", f"Report #{item_id} submitted for review.")
         user = conn.execute("SELECT full_name FROM users WHERE id=?", (session["user_id"],)).fetchone()
         label = user["full_name"] or "A user"
@@ -1236,11 +1253,11 @@ def claim(item_id):
                 flash("You already have an active claim request for this item.", "info")
                 return redirect(url_for("claim_conversation", claim_id=existing["id"]))
 
-            claim_row = conn.execute(
-                "INSERT INTO claims(item_id,claimant_id,reason,proof,proof_filename,id_filename,status,updated_at) VALUES(?,?,?,?,?,?,?,?) RETURNING id",
+            new_claim_id = insert_returning_id(
+                conn,
+                "INSERT INTO claims(item_id,claimant_id,reason,proof,proof_filename,id_filename,status,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                 (item_id, session["user_id"], reason, proof, proof_file, id_file, "PENDING REVIEW", now())
-            ).fetchone()
-            new_claim_id = claim_row["id"]
+            )
             admin = conn.execute("SELECT id FROM users WHERE upper(role)='ADMIN' AND account_status='ACTIVE' ORDER BY id LIMIT 1").fetchone()
             notify(conn, session["user_id"], f"Your claim request {claim_code(new_claim_id)} has been submitted for review.", "CLAIM_SUBMITTED", new_claim_id, item_id)
             if admin:
@@ -1681,7 +1698,7 @@ def admin_change_user_role(user_id):
 
     conn = get_connection()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        begin_admin_transaction(conn)
         actor = conn.execute(
             "SELECT * FROM users WHERE id=?",
             (session["user_id"],),
@@ -1758,7 +1775,7 @@ def admin_delete_user(user_id):
 
     conn = get_connection()
     try:
-        conn.execute("BEGIN IMMEDIATE")
+        begin_admin_transaction(conn)
         actor = conn.execute("SELECT * FROM users WHERE id=?", (session["user_id"],)).fetchone()
         user = conn.execute(
             "SELECT id,full_name,email,profile_picture,role,admin_level "
@@ -1828,7 +1845,7 @@ def admin_delete_user(user_id):
         conn.execute("UPDATE audit_logs SET user_id=NULL WHERE user_id=?", (user_id,))
         conn.execute("DELETE FROM users WHERE id=?", (user_id,))
         conn.commit()
-    except sqlite3.IntegrityError:
+    except INTEGRITY_ERRORS:
         conn.rollback()
         flash("The user could not be deleted because related records are still in use.", "danger")
         return redirect(url_for("admin_user_detail", user_id=user_id))

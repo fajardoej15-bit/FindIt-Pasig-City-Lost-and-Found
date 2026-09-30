@@ -13,6 +13,11 @@ from auth_controller import AuthController as RealAuthController
 class AdminRoleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.database_env_patch = patch.dict(
+            os.environ,
+            {"DATABASE_URL": "", "SECRET_KEY": "role-test-secret"},
+        )
+        cls.database_env_patch.start()
         cls.original_db_name = database.DB_NAME
         cls.temp_dir = tempfile.TemporaryDirectory()
         database.DB_NAME = str(Path(cls.temp_dir.name) / "roles-test.db")
@@ -42,7 +47,7 @@ class AdminRoleTests(unittest.TestCase):
         cls.auth_patch = patch.object(
             main,
             "AuthController",
-            lambda _path: RealAuthController(database.DB_NAME),
+            lambda: RealAuthController(),
         )
         cls.auth_patch.start()
         main.app.config.update(TESTING=True, SECRET_KEY="role-test-secret")
@@ -94,6 +99,7 @@ class AdminRoleTests(unittest.TestCase):
         cls.auth_patch.stop()
         database.DB_NAME = cls.original_db_name
         cls.temp_dir.cleanup()
+        cls.database_env_patch.stop()
 
     def setUp(self):
         self.client = self.main.app.test_client()
@@ -189,6 +195,33 @@ class AdminRoleTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"FindIt: Pasig City Lost &amp; Found", response.data)
         self.assertNotIn(b"SMART LOST &amp; FOUND", response.data)
+
+    def test_secret_key_requires_environment_value_outside_debug_mode(self):
+        with patch.dict(os.environ, {"SECRET_KEY": "", "FLASK_DEBUG": "false"}):
+            with self.assertRaisesRegex(RuntimeError, "SECRET_KEY must be set"):
+                self.main.configured_secret_key()
+
+        with patch.dict(
+            os.environ,
+            {
+                "SECRET_KEY": "",
+                "FLASK_DEBUG": "true",
+                "DATABASE_URL": "postgresql://configured-by-test",
+            },
+        ):
+            with self.assertRaisesRegex(RuntimeError, "SECRET_KEY must be set"):
+                self.main.configured_secret_key()
+
+    def test_secret_key_uses_environment_value_or_random_local_debug_value(self):
+        with patch.dict(os.environ, {"SECRET_KEY": "configured-secret"}):
+            self.assertEqual(self.main.configured_secret_key(), "configured-secret")
+
+        with patch.dict(os.environ, {"SECRET_KEY": "", "FLASK_DEBUG": "true"}):
+            first = self.main.configured_secret_key()
+            second = self.main.configured_secret_key()
+
+        self.assertEqual(len(first), 64)
+        self.assertNotEqual(first, second)
 
     def test_public_pages_work_without_an_admin_session(self):
         for path in ("/", "/login", "/register"):
