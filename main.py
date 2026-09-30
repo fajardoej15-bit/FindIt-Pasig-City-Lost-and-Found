@@ -174,7 +174,7 @@ def issue_otp(conn, user):
         "last_sent_at=excluded.last_sent_at",
         (user["id"], otp_hash(code), (sent_at + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat(), 0, 0, sent_at.isoformat()),
     )
-    return send_otp_email(user["email"], user["full_name"] or "there", code)
+    return code
 
 
 def pending_verification_user():
@@ -583,15 +583,19 @@ def register():
             flash("Please create a clear security question and answer.", "danger")
         else:
             conn = get_connection()
-            duplicate = conn.execute("SELECT id FROM users WHERE lower(email)=?", (email,)).fetchone()
-            if duplicate:
+            try:
+                duplicate = conn.execute(
+                    "SELECT id FROM users WHERE lower(email)=?",
+                    (email,),
+                ).fetchone()
+            finally:
                 conn.close()
+            if duplicate:
                 flash("That email is already registered.", "danger")
             else:
                 try:
                     profile_picture = save_avatar(request.files.get("profile_picture"))
                 except ValueError as exc:
-                    conn.close()
                     flash(str(exc), "danger")
                     return render_template("register.html")
 
@@ -601,24 +605,65 @@ def register():
                     "email": email,
                     "full_name": full_name,
                 }
-                pending_user["id"] = insert_returning_id(
-                    conn,
-                    "INSERT INTO users(username,email,password_hash,role,full_name,security_question,security_answer_hash,account_status,created_at,profile_picture) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "PENDING", now(), profile_picture),
-                )
+                conn = get_connection()
                 try:
-                    if not issue_otp(conn, pending_user):
-                        raise RuntimeError("Unable to send the verification email. Please try again later.")
-                except (OSError, RuntimeError, ValueError) as exc:
+                    pending_user["id"] = insert_returning_id(
+                        conn,
+                        "INSERT INTO users(username,email,password_hash,role,full_name,security_question,security_answer_hash,account_status,created_at,profile_picture) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "PENDING", now(), profile_picture),
+                    )
+                    otp_code = issue_otp(conn, pending_user)
+                    log_action(conn, "USER_REGISTERED_PENDING", f"{full_name} started email verification.")
+                    conn.commit()
+                except INTEGRITY_ERRORS:
                     conn.rollback()
-                    conn.close()
                     delete_avatar(profile_picture)
-                    flash(str(exc), "danger")
+                    duplicate = conn.execute(
+                        "SELECT id FROM users WHERE lower(email)=?",
+                        (email,),
+                    ).fetchone()
+                    if duplicate:
+                        flash("That email is already registered.", "danger")
+                        return render_template("register.html")
+                    raise
+                except Exception:
+                    conn.rollback()
+                    delete_avatar(profile_picture)
+                    raise
+                finally:
+                    conn.close()
+
+                try:
+                    email_sent = send_otp_email(
+                        pending_user["email"],
+                        pending_user["full_name"] or "there",
+                        otp_code,
+                    )
+                except (OSError, RuntimeError, smtplib.SMTPException, ValueError):
+                    email_sent = False
+                if not email_sent:
+                    cleanup_conn = get_connection()
+                    try:
+                        deleted = cleanup_conn.execute(
+                            "DELETE FROM users "
+                            "WHERE id=? AND account_status='PENDING'",
+                            (pending_user["id"],),
+                        ).rowcount
+                        cleanup_conn.commit()
+                    except Exception:
+                        cleanup_conn.rollback()
+                        raise
+                    finally:
+                        cleanup_conn.close()
+                    if deleted:
+                        delete_avatar(profile_picture)
+                    flash(
+                        "Unable to send the verification email. Please try again later.",
+                        "danger",
+                    )
                     return render_template("register.html")
-                log_action(conn, "USER_REGISTERED_PENDING", f"{full_name} started email verification.")
-                conn.commit()
-                conn.close()
+
                 session["pending_verification_user_id"] = pending_user["id"]
                 flash("A verification code has been sent to your email.", "success")
                 return redirect(url_for("verify_otp"))

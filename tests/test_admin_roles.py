@@ -10,6 +10,40 @@ import database
 from auth_controller import AuthController as RealAuthController
 
 
+class FakePostgresResult:
+    rowcount = 1
+
+    def fetchone(self):
+        return None
+
+
+class TrackedPostgresConnection:
+    backend = "postgres"
+
+    def __init__(self, events, name):
+        self.events = events
+        self.name = name
+        self.in_transaction = False
+        self.closed = False
+
+    def execute(self, _query, _parameters=()):
+        self.in_transaction = True
+        self.events.append((self.name, "execute"))
+        return FakePostgresResult()
+
+    def commit(self):
+        self.in_transaction = False
+        self.events.append((self.name, "commit"))
+
+    def rollback(self):
+        self.in_transaction = False
+        self.events.append((self.name, "rollback"))
+
+    def close(self):
+        self.closed = True
+        self.events.append((self.name, "close"))
+
+
 class AdminRoleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -240,7 +274,8 @@ class AdminRoleTests(unittest.TestCase):
         email = f"new-{self.id().lower()}@example.test"
         with (
             patch.object(self.main, "AuthController", RealAuthController),
-            patch.object(self.main, "issue_otp", return_value=True),
+            patch.object(self.main, "issue_otp", return_value="123456"),
+            patch.object(self.main, "send_otp_email", return_value=True),
         ):
             response = self.client.post(
                 "/register",
@@ -260,6 +295,106 @@ class AdminRoleTests(unittest.TestCase):
         self.assertIsNotNone(user)
         self.assertEqual(user["role"], "user")
         self.assertEqual(user["account_status"], "PENDING")
+
+    def test_postgres_registration_commits_and_closes_before_smtp(self):
+        events = []
+        duplicate_check = TrackedPostgresConnection(events, "duplicate-check")
+        registration = TrackedPostgresConnection(events, "registration")
+
+        def send_email(_email, _name, _code):
+            events.append(
+                (
+                    "smtp",
+                    registration.in_transaction,
+                    registration.closed,
+                )
+            )
+            return True
+
+        with (
+            patch.object(self.main, "AuthController", RealAuthController),
+            patch.object(
+                self.main,
+                "get_connection",
+                side_effect=[duplicate_check, registration],
+            ),
+            patch.object(self.main, "insert_returning_id", return_value=9001),
+            patch.object(self.main, "send_otp_email", side_effect=send_email),
+            patch.object(self.main.secrets, "randbelow", return_value=123456),
+        ):
+            response = self.client.post(
+                "/register",
+                data={
+                    "full_name": "Postgres User",
+                    "email": f"postgres-{self.id().lower()}@example.test",
+                    "password": "Password123",
+                    "confirm_password": "Password123",
+                    "security_question": "What is your favorite city?",
+                    "security_answer": "Pasig",
+                },
+            )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertLess(events.index(("registration", "commit")), events.index(("registration", "close")))
+        smtp_event = next(event for event in events if event[0] == "smtp")
+        self.assertEqual(smtp_event, ("smtp", False, True))
+
+    def test_duplicate_email_fails_before_attempting_registration_or_smtp(self):
+        with patch.object(self.main, "send_otp_email") as send_email:
+            response = self.client.post(
+                "/register",
+                data={
+                    "full_name": "Duplicate User",
+                    "email": "user@example.test",
+                    "password": "Password123",
+                    "confirm_password": "Password123",
+                    "security_question": "What is your favorite city?",
+                    "security_answer": "Pasig",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"That email is already registered.", response.data)
+        send_email.assert_not_called()
+
+    def test_failed_registration_email_removes_pending_user_and_otp(self):
+        email = f"mail-failure-{self.id().lower()}@example.test"
+        issued_user_ids = []
+        original_issue_otp = self.main.issue_otp
+
+        def issue_and_record_user_id(conn, user):
+            issued_user_ids.append(user["id"])
+            return original_issue_otp(conn, user)
+
+        with (
+            patch.object(self.main, "AuthController", RealAuthController),
+            patch.object(self.main, "issue_otp", side_effect=issue_and_record_user_id),
+            patch.object(self.main, "send_otp_email", return_value=False),
+            patch.object(self.main.secrets, "randbelow", return_value=123456),
+        ):
+            response = self.client.post(
+                "/register",
+                data={
+                    "full_name": "Mail Failure",
+                    "email": email,
+                    "password": "Password123",
+                    "confirm_password": "Password123",
+                    "security_question": "What is your favorite city?",
+                    "security_answer": "Pasig",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Unable to send the verification email.", response.data)
+        self.assertEqual(len(issued_user_ids), 1)
+        self.assertIsNone(self.account(email))
+        conn = database.get_connection()
+        remaining_otps = conn.execute(
+            "SELECT COUNT(*) FROM otp_verifications WHERE user_id=?",
+            (issued_user_ids[0],),
+        ).fetchone()[0]
+        conn.close()
+        self.assertEqual(remaining_otps, 0)
 
     def test_registration_sends_gmail_otp_and_verification_activates_user(self):
         email = f"gmail-{self.id().lower()}@example.test"
