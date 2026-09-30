@@ -261,7 +261,10 @@ class AdminRoleTests(unittest.TestCase):
         smtp.starttls.assert_called_once_with()
         smtp.login.assert_called_once_with("sender@gmail.com", "test-app-password")
         message = smtp.send_message.call_args.args[0]
-        self.assertEqual(message["From"], "sender@gmail.com")
+        self.assertEqual(
+            message["From"],
+            '"FindIt: Pasig City Lost & Found" <sender@gmail.com>',
+        )
         self.assertEqual(message["To"], email)
         self.assertEqual(
             message["Subject"],

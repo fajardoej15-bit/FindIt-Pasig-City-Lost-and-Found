@@ -10,6 +10,7 @@ import secrets
 import sqlite3
 import smtplib
 from email.message import EmailMessage
+from email.utils import formataddr
 
 from flask import Flask, abort, flash, redirect, render_template, request, send_from_directory, session, url_for
 from PIL import Image, UnidentifiedImageError
@@ -119,7 +120,7 @@ def send_otp_email(email, full_name, code):
         return False
 
     message = EmailMessage()
-    message["From"] = mail_username
+    message["From"] = formataddr(("FindIt: Pasig City Lost & Found", mail_username))
     message["To"] = email
     message["Subject"] = "FindIt: Pasig City Lost & Found - Email Verification"
     message.set_content(
