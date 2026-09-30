@@ -32,7 +32,6 @@
                     <a href="{{ url_for('admin_claims') }}">Claim Requests</a>
                     <a href="{{ url_for('admin_messages') }}">Messages{% if unread_messages %} ({{ unread_messages }}){% endif %}</a>
                     <a href="{{ url_for('profile') }}">Profile</a>
-                    <a href="{{ url_for('logout') }}">Logout</a>
                 {% else %}
                     <a href="{{ url_for('dashboard') }}">Dashboard</a>
                     <a href="{{ url_for('browse',type='FOUND') }}">Found Items</a>
@@ -40,7 +39,6 @@
                     <a href="{{ url_for('messages') }}">Messages{% if unread_messages %} ({{ unread_messages }}){% endif %}</a>
                     <a href="{{ url_for('notifications') }}">Notifications{% if unread_notifications %} ({{ unread_notifications }}){% endif %}</a>
                     <a href="{{ url_for('profile') }}">Profile</a>
-                    <a href="{{ url_for('logout') }}">Logout</a>
                 {% endif %}
             {% else %}
                 <a href="{{ url_for('home') }}">Home</a>
