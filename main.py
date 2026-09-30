@@ -112,67 +112,57 @@ def otp_hash(code):
 
 
 def send_otp_email(email, full_name, code):
-    api_key = os.getenv("BREVO_API_KEY", "").strip()
-    sender_email = os.getenv("BREVO_SENDER_EMAIL", "").strip()
-    sender_name = os.getenv("BREVO_SENDER_NAME", "").strip()
-    if not api_key or not sender_email or not sender_name:
-        app.logger.error(
-            "Brevo configuration missing: api_key=%s, sender_email=%s, sender_name=%s",
-            "SET" if api_key else "MISSING",
-            "SET" if sender_email else "MISSING",
-            "SET" if sender_name else "MISSING",
-        )
+    api_key = os.getenv("RESEND_API_KEY", "").strip()
+    if not api_key:
+        app.logger.error("Resend configuration missing: RESEND_API_KEY is not set.")
         return False
 
     payload = {
-        "sender": {
-            "name": sender_name,
-            "email": sender_email,
-        },
-        "to": [{"email": email, "name": full_name}],
+        "from": "SMART Lost & Found <onboarding@resend.dev>",
+        "to": [email],
         "subject": "FindIt: Pasig City Lost & Found - Email Verification",
-        "textContent": (
+        "text": (
             f"Hello {full_name},\n\n"
-            f"Your FindIt verification code is: {code}\n\n"
+            "Thank you for registering with FindIt: Pasig City Lost & Found.\n\n"
+            f"Your verification code is:\n\n{code}\n\n"
             "This code expires in 10 minutes.\n\n"
-            "If you did not create this account, you can ignore this email."
+            "If you did not create this account, you can ignore this email.\n\n"
+            "Thank you,\nFindIt: Pasig City Lost & Found"
         ),
     }
     request = Request(
-        "https://api.brevo.com/v3/smtp/email",
+        "https://api.resend.com/emails",
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
-            "Accept": "application/json",
-            "api-key": api_key,
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "FindIt-Pasig-LostFound/1.0",
         },
         method="POST",
     )
-    try:
-        app.logger.info("Attempting Brevo API request to https://api.brevo.com/v3/smtp/email")
-        with urlopen(request, timeout=20) as response:
-            app.logger.info("Brevo API response: status=%s", response.status)
-            return 200 <= response.status < 300
-    except HTTPError as exc:
-        response_body = exc.read().decode("utf-8", errors="replace")
-        try:
-            error_response = json.loads(response_body)
-        except json.JSONDecodeError:
-            error_response = {}
-        error_code = error_response.get("code", "unknown")
-        error_message = str(error_response.get("message", "Unstructured API error"))
-        error_message = error_message.replace(api_key, "[redacted]")
-        error_message = error_message.replace(code, "[redacted]")[:500]
+
+    def log_resend_http_error(status, response):
+        response_body = response.read().decode("utf-8", errors="replace")
+        response_body = response_body.replace(api_key, "[redacted]")
+        response_body = response_body.replace(code, "[redacted]")[:500]
         app.logger.error(
-            "Brevo API HTTP error: status=%s code=%s message=%s",
-            exc.code,
-            error_code,
-            error_message,
+            "Resend API HTTP error: status=%s body=%s",
+            status,
+            response_body or "<empty>",
         )
+
+    try:
+        with urlopen(request, timeout=20) as response:
+            if response.status not in {200, 201}:
+                log_resend_http_error(response.status, response)
+                return False
+            return True
+    except HTTPError as exc:
+        log_resend_http_error(exc.code, exc)
         return False
     except (URLError, TimeoutError, OSError) as exc:
         app.logger.error(
-            "Brevo API connection error: type=%s message=%s",
+            "Resend API connection error: type=%s message=%s",
             type(exc).__name__,
             str(exc),
         )
@@ -619,7 +609,7 @@ def register():
                 }
                 conn.execute(
                     "INSERT INTO users(username,email,password_hash,role,full_name,security_question,security_answer_hash,account_status,created_at,profile_picture) "
-                    "VALUES(?,?,?,?,?,?,?,CURRENT_TIMESTAMP,?)",
+                    "VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP,?)",
                     (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "PENDING", profile_picture)
                 )
                 pending_user["id"] = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
