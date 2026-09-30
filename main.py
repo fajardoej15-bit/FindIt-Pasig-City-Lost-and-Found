@@ -158,8 +158,13 @@ def send_otp_email(email, full_name, code):
         return True
     except (OSError, smtplib.SMTPException, ValueError) as exc:
         app.logger.error(
-            "Gmail SMTP email delivery failed: type=%s",
+            "Gmail SMTP email delivery failed: type=%s str=%s repr=%r "
+            "errno=%s strerror=%s",
             type(exc).__name__,
+            str(exc),
+            repr(exc),
+            getattr(exc, "errno", None),
+            getattr(exc, "strerror", None),
         )
         return False
 
