@@ -149,17 +149,31 @@ def send_otp_email(email, full_name, code):
         "Thank you,\nFindIt: Pasig City Lost & Found"
     )
 
+    stage = "connection"
     try:
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as smtp:
+            stage = "STARTTLS"
             smtp.starttls()
+            stage = "authentication"
             smtp.login(mail_username, mail_password)
+            stage = "sending"
             smtp.send_message(message)
         return True
     except (OSError, smtplib.SMTPException, ValueError) as exc:
-        app.logger.error(
-            "Gmail SMTP email delivery failed: type=%s",
-            type(exc).__name__,
-        )
+        if isinstance(exc, OSError):
+            errno = exc.errno if isinstance(exc.errno, int) else None
+            app.logger.error(
+                "Gmail SMTP %s failed: type=%s errno=%s",
+                stage,
+                type(exc).__name__,
+                errno,
+            )
+        else:
+            app.logger.error(
+                "Gmail SMTP %s failed: type=%s",
+                stage,
+                type(exc).__name__,
+            )
         return False
 
 
