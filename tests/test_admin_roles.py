@@ -228,15 +228,18 @@ class AdminRoleTests(unittest.TestCase):
         self.assertEqual(user["role"], "user")
         self.assertEqual(user["account_status"], "PENDING")
 
-    def test_registration_sends_resend_otp_and_verification_activates_user(self):
-        email = f"resend-{self.id().lower()}@example.test"
-        resend_response = Mock(status=201)
-        resend_response.__enter__ = Mock(return_value=resend_response)
-        resend_response.__exit__ = Mock(return_value=False)
+    def test_registration_sends_gmail_otp_and_verification_activates_user(self):
+        email = f"gmail-{self.id().lower()}@example.test"
         with (
             patch.object(self.main, "AuthController", RealAuthController),
-            patch.dict(os.environ, {"RESEND_API_KEY": "re_test_key"}),
-            patch.object(self.main, "urlopen", return_value=resend_response) as resend_request,
+            patch.dict(
+                os.environ,
+                {
+                    "MAIL_USERNAME": "sender@gmail.com",
+                    "MAIL_PASSWORD": "test-app-password",
+                },
+            ),
+            patch.object(self.main.smtplib, "SMTP") as smtp_factory,
             patch.object(self.main.secrets, "randbelow", return_value=123456),
         ):
             response = self.client.post(
@@ -253,14 +256,18 @@ class AdminRoleTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 302)
         self.assertTrue(response.location.endswith("/verify-otp"))
-        request = resend_request.call_args.args[0]
-        self.assertEqual(request.full_url, "https://api.resend.com/emails")
-        self.assertEqual(request.get_header("Authorization"), "Bearer re_test_key")
-        payload = json.loads(request.data)
-        self.assertEqual(payload["from"], "SMART Lost & Found <onboarding@resend.dev>")
-        self.assertEqual(payload["to"], [email])
-        self.assertIn("123456", payload["text"])
-
+        smtp_factory.assert_called_once_with("smtp.gmail.com", 587, timeout=20)
+        smtp = smtp_factory.return_value.__enter__.return_value
+        smtp.starttls.assert_called_once_with()
+        smtp.login.assert_called_once_with("sender@gmail.com", "test-app-password")
+        message = smtp.send_message.call_args.args[0]
+        self.assertEqual(message["From"], "sender@gmail.com")
+        self.assertEqual(message["To"], email)
+        self.assertEqual(
+            message["Subject"],
+            "FindIt: Pasig City Lost & Found - Email Verification",
+        )
+        self.assertIn("123456", message.get_content())
         user = self.account(email)
         self.assertEqual(user["account_status"], "PENDING")
         conn = database.get_connection()

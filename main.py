@@ -8,8 +8,8 @@ import os
 import re
 import secrets
 import sqlite3
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+import smtplib
+from email.message import EmailMessage
 
 from flask import Flask, abort, flash, redirect, render_template, request, send_from_directory, session, url_for
 from PIL import Image, UnidentifiedImageError
@@ -112,59 +112,35 @@ def otp_hash(code):
 
 
 def send_otp_email(email, full_name, code):
-    api_key = os.getenv("RESEND_API_KEY", "").strip()
-    if not api_key:
-        app.logger.error("Resend configuration missing: RESEND_API_KEY is not set.")
+    mail_username = os.getenv("MAIL_USERNAME", "").strip()
+    mail_password = os.getenv("MAIL_PASSWORD", "").strip()
+    if not mail_username or not mail_password:
+        app.logger.error("Gmail SMTP configuration missing: MAIL_USERNAME or MAIL_PASSWORD is not set.")
         return False
 
-    payload = {
-        "from": "SMART Lost & Found <onboarding@resend.dev>",
-        "to": [email],
-        "subject": "FindIt: Pasig City Lost & Found - Email Verification",
-        "text": (
-            f"Hello {full_name},\n\n"
-            "Thank you for registering with FindIt: Pasig City Lost & Found.\n\n"
-            f"Your verification code is:\n\n{code}\n\n"
-            "This code expires in 10 minutes.\n\n"
-            "If you did not create this account, you can ignore this email.\n\n"
-            "Thank you,\nFindIt: Pasig City Lost & Found"
-        ),
-    }
-    request = Request(
-        "https://api.resend.com/emails",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "FindIt-Pasig-LostFound/1.0",
-        },
-        method="POST",
+    message = EmailMessage()
+    message["From"] = mail_username
+    message["To"] = email
+    message["Subject"] = "FindIt: Pasig City Lost & Found - Email Verification"
+    message.set_content(
+        f"Hello {full_name},\n\n"
+        "Thank you for registering with FindIt: Pasig City Lost & Found.\n\n"
+        f"Your verification code is:\n\n{code}\n\n"
+        "This code expires in 10 minutes.\n\n"
+        "If you did not create this account, you can ignore this email.\n\n"
+        "Thank you,\nFindIt: Pasig City Lost & Found"
     )
 
-    def log_resend_http_error(status, response):
-        response_body = response.read().decode("utf-8", errors="replace")
-        response_body = response_body.replace(api_key, "[redacted]")
-        response_body = response_body.replace(code, "[redacted]")[:500]
-        app.logger.error(
-            "Resend API HTTP error: status=%s body=%s",
-            status,
-            response_body or "<empty>",
-        )
-
     try:
-        with urlopen(request, timeout=20) as response:
-            if response.status not in {200, 201}:
-                log_resend_http_error(response.status, response)
-                return False
-            return True
-    except HTTPError as exc:
-        log_resend_http_error(exc.code, exc)
-        return False
-    except (URLError, TimeoutError, OSError) as exc:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as smtp:
+            smtp.starttls()
+            smtp.login(mail_username, mail_password)
+            smtp.send_message(message)
+        return True
+    except (OSError, smtplib.SMTPException, ValueError) as exc:
         app.logger.error(
-            "Resend API connection error: type=%s message=%s",
+            "Gmail SMTP email delivery failed: type=%s",
             type(exc).__name__,
-            str(exc),
         )
         return False
 
