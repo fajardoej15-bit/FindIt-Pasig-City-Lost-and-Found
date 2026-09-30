@@ -133,6 +133,17 @@ def send_otp_email(email, full_name, code):
     api_key = os.getenv("RESEND_API_KEY", "").strip()
     sender = os.getenv("MAIL_USERNAME", "").strip()
     test_email = os.getenv("RESEND_TEST_EMAIL", "").strip()
+    app.logger.info("Resend API key configured: %s", bool(api_key))
+    app.logger.info("Resend sender configured: %s", bool(sender))
+    app.logger.info("Resend test email configured: %s", bool(test_email))
+    app.logger.info(
+        "Resend test recipient match: %s",
+        bool(test_email and email.strip().casefold() == test_email.casefold()),
+    )
+    app.logger.info(
+        "Resend testing sender active: %s",
+        sender.casefold() == "onboarding@resend.dev",
+    )
     if (
         sender.casefold() == "onboarding@resend.dev"
         and (
@@ -175,6 +186,7 @@ def send_otp_email(email, full_name, code):
     )
     stage = "HTTPS request"
     try:
+        app.logger.info("Submitting email through Resend HTTPS API")
         with urllib.request.urlopen(api_request, timeout=20) as response:
             status = response.status
         if 200 <= status < 300:
