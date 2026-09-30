@@ -7,9 +7,8 @@ import json
 import os
 import re
 import secrets
-import urllib.error
-import urllib.request
-from email.utils import formataddr
+import smtplib
+from email.message import EmailMessage
 
 from flask import Flask, abort, flash, redirect, render_template, request, send_from_directory, session, url_for
 from PIL import Image, UnidentifiedImageError
@@ -130,38 +129,19 @@ def otp_hash(code):
 
 
 def send_otp_email(email, full_name, code):
-    api_key = os.getenv("RESEND_API_KEY", "").strip()
-    sender = os.getenv("MAIL_USERNAME", "").strip()
-    test_email = os.getenv("RESEND_TEST_EMAIL", "").strip()
-    app.logger.warning("Resend API key configured: %s", bool(api_key))
-    app.logger.warning("Resend sender configured: %s", bool(sender))
-    app.logger.warning("Resend test email configured: %s", bool(test_email))
-    app.logger.warning(
-        "Resend test recipient match: %s",
-        bool(test_email and email.strip().casefold() == test_email.casefold()),
-    )
-    app.logger.warning(
-        "Resend testing sender active: %s",
-        sender.casefold() == "onboarding@resend.dev",
-    )
-    if (
-        sender.casefold() == "onboarding@resend.dev"
-        and (
-            not test_email
-            or email.strip().casefold() != test_email.casefold()
-        )
-    ):
-        app.logger.warning(
-            "Resend testing-domain recipient restriction prevented email submission."
-        )
-        return False
-    if not api_key or not sender:
+    mail_username = os.getenv("MAIL_USERNAME", "").strip()
+    mail_password = os.getenv("MAIL_PASSWORD", "").strip()
+    if not mail_username or not mail_password:
         app.logger.error(
-            "Resend email configuration missing: RESEND_API_KEY or sender is not set."
+            "Gmail SMTP configuration missing: MAIL_USERNAME or MAIL_PASSWORD is not set."
         )
         return False
 
-    body = (
+    message = EmailMessage()
+    message["From"] = mail_username
+    message["To"] = email
+    message["Subject"] = "FindIt: Pasig City Lost & Found - Email Verification"
+    message.set_content(
         f"Hello {full_name},\n\n"
         "Thank you for registering with FindIt: Pasig City Lost & Found.\n\n"
         f"Your verification code is:\n\n{code}\n\n"
@@ -169,46 +149,16 @@ def send_otp_email(email, full_name, code):
         "If you did not create this account, you can ignore this email.\n\n"
         "Thank you,\nFindIt: Pasig City Lost & Found"
     )
-    payload = {
-        "from": formataddr(("FindIt: Pasig City Lost & Found", sender)),
-        "to": [email],
-        "subject": "FindIt: Pasig City Lost & Found - Email Verification",
-        "text": body,
-    }
-    api_request = urllib.request.Request(
-        "https://api.resend.com/emails",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    stage = "HTTPS request"
+
     try:
-        app.logger.warning("Submitting email through Resend HTTPS API")
-        with urllib.request.urlopen(api_request, timeout=20) as response:
-            status = response.status
-        if 200 <= status < 300:
-            return True
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as smtp:
+            smtp.starttls()
+            smtp.login(mail_username, mail_password)
+            smtp.send_message(message)
+        return True
+    except (OSError, smtplib.SMTPException, ValueError) as exc:
         app.logger.error(
-            "Resend email submission failed: stage=HTTP response "
-            "type=HTTPError http_status=%s",
-            status,
-        )
-        return False
-    except urllib.error.HTTPError as exc:
-        app.logger.error(
-            "Resend email submission failed: stage=%s type=%s http_status=%s",
-            stage,
-            type(exc).__name__,
-            exc.code if isinstance(exc.code, int) else None,
-        )
-        return False
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        app.logger.error(
-            "Resend email submission failed: stage=%s type=%s",
-            stage,
+            "Gmail SMTP email delivery failed: type=%s",
             type(exc).__name__,
         )
         return False
@@ -632,19 +582,6 @@ def register():
             flash("Passwords do not match.", "danger")
         elif len(question) < 8 or len(answer) < 2:
             flash("Please create a clear security question and answer.", "danger")
-        elif (
-            os.getenv("MAIL_USERNAME", "").strip().casefold()
-            == "onboarding@resend.dev"
-            and (
-                not os.getenv("RESEND_TEST_EMAIL", "").strip()
-                or email.casefold()
-                != os.getenv("RESEND_TEST_EMAIL", "").strip().casefold()
-            )
-        ):
-            flash(
-                "Email verification is currently limited to the configured testing email address.",
-                "danger",
-            )
         else:
             conn = get_connection()
             try:
