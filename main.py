@@ -132,6 +132,18 @@ def otp_hash(code):
 def send_otp_email(email, full_name, code):
     api_key = os.getenv("RESEND_API_KEY", "").strip()
     sender = os.getenv("MAIL_USERNAME", "").strip()
+    test_email = os.getenv("RESEND_TEST_EMAIL", "").strip()
+    if (
+        sender.casefold() == "onboarding@resend.dev"
+        and (
+            not test_email
+            or email.strip().casefold() != test_email.casefold()
+        )
+    ):
+        app.logger.warning(
+            "Resend testing-domain recipient restriction prevented email submission."
+        )
+        return False
     if not api_key or not sender:
         app.logger.error(
             "Resend email configuration missing: RESEND_API_KEY or sender is not set."
@@ -608,6 +620,19 @@ def register():
             flash("Passwords do not match.", "danger")
         elif len(question) < 8 or len(answer) < 2:
             flash("Please create a clear security question and answer.", "danger")
+        elif (
+            os.getenv("MAIL_USERNAME", "").strip().casefold()
+            == "onboarding@resend.dev"
+            and (
+                not os.getenv("RESEND_TEST_EMAIL", "").strip()
+                or email.casefold()
+                != os.getenv("RESEND_TEST_EMAIL", "").strip().casefold()
+            )
+        ):
+            flash(
+                "Email verification is currently limited to the configured testing email address.",
+                "danger",
+            )
         else:
             conn = get_connection()
             try:
@@ -667,7 +692,7 @@ def register():
                         pending_user["full_name"] or "there",
                         otp_code,
                     )
-                except (OSError, RuntimeError, smtplib.SMTPException, ValueError):
+                except (OSError, RuntimeError, ValueError):
                     email_sent = False
                 if not email_sent:
                     cleanup_conn = get_connection()

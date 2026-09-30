@@ -403,7 +403,8 @@ class AdminRoleTests(unittest.TestCase):
             patch.dict(
                 os.environ,
                 {
-                    "MAIL_USERNAME": "sender@gmail.com",
+                    "MAIL_USERNAME": "onboarding@resend.dev",
+                    "RESEND_TEST_EMAIL": email,
                     "RESEND_API_KEY": "test-resend-key",
                 },
             ),
@@ -434,7 +435,7 @@ class AdminRoleTests(unittest.TestCase):
         payload = json.loads(api_request.data)
         self.assertEqual(
             payload["from"],
-            '"FindIt: Pasig City Lost & Found" <sender@gmail.com>',
+            '"FindIt: Pasig City Lost & Found" <onboarding@resend.dev>',
         )
         self.assertEqual(payload["to"], [email])
         self.assertEqual(
@@ -456,6 +457,62 @@ class AdminRoleTests(unittest.TestCase):
         self.assertEqual(verification.status_code, 302)
         self.assertEqual(verification.location, "/login")
         self.assertEqual(self.account(email)["account_status"], "ACTIVE")
+
+    def test_resend_testing_domain_blocks_non_configured_registration_recipient(self):
+        email = f"not-allowed-{self.id().lower()}@example.test"
+        with (
+            patch.object(self.main, "AuthController", RealAuthController),
+            patch.dict(
+                os.environ,
+                {
+                    "MAIL_USERNAME": "onboarding@resend.dev",
+                    "RESEND_TEST_EMAIL": "resend-owner@example.test",
+                    "RESEND_API_KEY": "test-resend-key",
+                },
+            ),
+            patch.object(self.main.urllib.request, "urlopen") as urlopen,
+        ):
+            response = self.client.post(
+                "/register",
+                data={
+                    "full_name": "Restricted Recipient",
+                    "email": email,
+                    "password": "Password123",
+                    "confirm_password": "Password123",
+                    "security_question": "What is your favorite city?",
+                    "security_answer": "Pasig",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            b"Email verification is currently limited to the configured testing email address.",
+            response.data,
+        )
+        self.assertNotIn(b"resend-owner@example.test", response.data)
+        urlopen.assert_not_called()
+        self.assertIsNone(self.account(email))
+
+    def test_resend_testing_domain_without_configured_recipient_does_not_call_api(self):
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "MAIL_USERNAME": "onboarding@resend.dev",
+                    "RESEND_TEST_EMAIL": "",
+                    "RESEND_API_KEY": "test-resend-key",
+                },
+            ),
+            patch.object(self.main.urllib.request, "urlopen") as urlopen,
+        ):
+            result = self.main.send_otp_email(
+                "somebody@example.test",
+                "Test User",
+                "123456",
+            )
+
+        self.assertFalse(result)
+        urlopen.assert_not_called()
 
     def test_incorrect_and_expired_registration_otp_do_not_activate_account(self):
         email = f"otp-check-{self.id().lower()}@example.test"
