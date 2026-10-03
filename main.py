@@ -7,9 +7,10 @@ import json
 import os
 import re
 import secrets
-import smtplib
-from email.message import EmailMessage
+import urllib.error
+import urllib.request
 
+from dotenv import load_dotenv
 from flask import Flask, abort, flash, redirect, render_template, request, send_from_directory, session, url_for
 from PIL import Image, UnidentifiedImageError
 from werkzeug.utils import secure_filename
@@ -24,6 +25,8 @@ from database import (
 )
 
 BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
 PUBLIC_UPLOAD_DIR = BASE_DIR / "static" / "uploads"
 PRIVATE_UPLOAD_DIR = BASE_DIR / "private_uploads"
 AVATAR_UPLOAD_DIR = BASE_DIR / "static" / "uploads" / "avatars"
@@ -129,42 +132,66 @@ def otp_hash(code):
 
 
 def send_otp_email(email, full_name, code):
-    mail_username = os.getenv("MAIL_USERNAME", "").strip()
-    mail_password = os.getenv("MAIL_PASSWORD", "").strip()
-    if not mail_username or not mail_password:
+    api_key = os.getenv("BREVO_API_KEY", "").strip()
+    sender_email = os.getenv("BREVO_SENDER_EMAIL", "").strip()
+    sender_name = os.getenv("BREVO_SENDER_NAME", "").strip()
+    missing = [
+        name
+        for name, value in (
+            ("BREVO_API_KEY", api_key),
+            ("BREVO_SENDER_EMAIL", sender_email),
+            ("BREVO_SENDER_NAME", sender_name),
+        )
+        if not value
+    ]
+    if missing:
         app.logger.error(
-            "Gmail SMTP configuration missing: MAIL_USERNAME or MAIL_PASSWORD is not set."
+            "Brevo email configuration missing: %s", ", ".join(missing)
         )
         return False
 
-    message = EmailMessage()
-    message["From"] = mail_username
-    message["To"] = email
-    message["Subject"] = "FindIt: Pasig City Lost & Found - Email Verification"
-    message.set_content(
-        f"Hello {full_name},\n\n"
-        "Thank you for registering with FindIt: Pasig City Lost & Found.\n\n"
-        f"Your verification code is:\n\n{code}\n\n"
-        "This code expires in 10 minutes.\n\n"
-        "If you did not create this account, you can ignore this email.\n\n"
-        "Thank you,\nFindIt: Pasig City Lost & Found"
+    payload = {
+        "sender": {"name": sender_name, "email": sender_email},
+        "to": [{"email": email, "name": full_name}],
+        "subject": "FindIt: Pasig City Lost & Found - Email Verification",
+        "textContent": (
+            f"Hello {full_name},\n\n"
+            "Thank you for registering with FindIt: Pasig City Lost & Found.\n\n"
+            f"Your verification code is:\n\n{code}\n\n"
+            "This code expires in 10 minutes.\n\n"
+            "If you did not create this account, you can ignore this email.\n\n"
+            "Thank you,\nFindIt: Pasig City Lost & Found"
+        ),
+    }
+    api_request = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "accept": "application/json",
+            "api-key": api_key,
+            "content-type": "application/json",
+        },
+        method="POST",
     )
-
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as smtp:
-            smtp.starttls()
-            smtp.login(mail_username, mail_password)
-            smtp.send_message(message)
+        with urllib.request.urlopen(api_request, timeout=20) as response:
+            if not 200 <= response.status < 300:
+                app.logger.error(
+                    "Brevo transactional email failed: http_status=%s",
+                    response.status,
+                )
+                return False
         return True
-    except (OSError, smtplib.SMTPException, ValueError) as exc:
+    except urllib.error.HTTPError as exc:
         app.logger.error(
-            "Gmail SMTP email delivery failed: type=%s str=%s repr=%r "
-            "errno=%s strerror=%s",
+            "Brevo transactional email rejected: http_status=%s", exc.code
+        )
+        exc.close()
+        return False
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        app.logger.error(
+            "Brevo transactional email request failed: type=%s",
             type(exc).__name__,
-            str(exc),
-            repr(exc),
-            getattr(exc, "errno", None),
-            getattr(exc, "strerror", None),
         )
         return False
 
@@ -439,8 +466,24 @@ def update_matches(conn):
                     log_action(conn, "MATCH_DETECTED", f"Possible match detected for reports #{lost['id']} and #{found['id']}.")
 
 
-def log_action(conn, action, details):
-    conn.execute("INSERT INTO audit_logs(user_id,action,details) VALUES(?,?,?)", (session.get("user_id"), action, details))
+def log_action(conn, action, details, user_id=None):
+    actor_id = session.get("user_id") if user_id is None else user_id
+    conn.execute(
+        "INSERT INTO audit_logs(user_id,action,details) VALUES(?,?,?)",
+        (actor_id, action, details),
+    )
+
+
+def delete_pending_user(conn, user_id):
+    conn.execute(
+        "UPDATE audit_logs SET user_id=NULL WHERE user_id=? "
+        "AND EXISTS(SELECT 1 FROM users WHERE id=? AND account_status='PENDING')",
+        (user_id, user_id),
+    )
+    return conn.execute(
+        "DELETE FROM users WHERE id=? AND account_status='PENDING'",
+        (user_id,),
+    ).rowcount
 
 
 def notify(conn, user_id, message, notification_type="INFO", claim_id=None, item_id=None):
@@ -613,30 +656,52 @@ def register():
                 }
                 conn = get_connection()
                 try:
-                    pending_user["id"] = insert_returning_id(
-                        conn,
-                        "INSERT INTO users(username,email,password_hash,role,full_name,security_question,security_answer_hash,account_status,created_at,profile_picture) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                        (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "PENDING", now(), profile_picture),
-                    )
-                    otp_code = issue_otp(conn, pending_user)
-                    log_action(conn, "USER_REGISTERED_PENDING", f"{full_name} started email verification.")
-                    conn.commit()
-                except INTEGRITY_ERRORS:
-                    conn.rollback()
-                    delete_avatar(profile_picture)
-                    duplicate = conn.execute(
-                        "SELECT id FROM users WHERE lower(email)=?",
-                        (email,),
-                    ).fetchone()
-                    if duplicate:
-                        flash("That email is already registered.", "danger")
-                        return render_template("register.html")
-                    raise
-                except Exception:
-                    conn.rollback()
-                    delete_avatar(profile_picture)
-                    raise
+                    try:
+                        pending_user["id"] = insert_returning_id(
+                            conn,
+                            "INSERT INTO users(username,email,password_hash,role,full_name,security_question,security_answer_hash,account_status,created_at,profile_picture) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (username, email, AuthController.password_hash(password), "user", full_name, question, AuthController.security_answer_hash(answer), "PENDING", now(), profile_picture),
+                        )
+                        conn.commit()
+                    except INTEGRITY_ERRORS:
+                        conn.rollback()
+                        duplicate = conn.execute(
+                            "SELECT id FROM users WHERE lower(email)=?",
+                            (email,),
+                        ).fetchone()
+                        delete_avatar(profile_picture)
+                        if duplicate:
+                            flash("That email is already registered.", "danger")
+                            return render_template("register.html")
+                        raise
+                    except Exception:
+                        conn.rollback()
+                        delete_avatar(profile_picture)
+                        raise
+
+                    try:
+                        otp_code = issue_otp(conn, pending_user)
+                        log_action(
+                            conn,
+                            "USER_REGISTERED_PENDING",
+                            f"{full_name} started email verification.",
+                            user_id=pending_user["id"],
+                        )
+                        conn.commit()
+                    except Exception:
+                        conn.rollback()
+                        cleanup_conn = get_connection()
+                        try:
+                            delete_pending_user(cleanup_conn, pending_user["id"])
+                            cleanup_conn.commit()
+                        except Exception:
+                            cleanup_conn.rollback()
+                            raise
+                        finally:
+                            cleanup_conn.close()
+                        delete_avatar(profile_picture)
+                        raise
                 finally:
                     conn.close()
 
@@ -651,11 +716,9 @@ def register():
                 if not email_sent:
                     cleanup_conn = get_connection()
                     try:
-                        deleted = cleanup_conn.execute(
-                            "DELETE FROM users "
-                            "WHERE id=? AND account_status='PENDING'",
-                            (pending_user["id"],),
-                        ).rowcount
+                        deleted = delete_pending_user(
+                            cleanup_conn, pending_user["id"]
+                        )
                         cleanup_conn.commit()
                     except Exception:
                         cleanup_conn.rollback()

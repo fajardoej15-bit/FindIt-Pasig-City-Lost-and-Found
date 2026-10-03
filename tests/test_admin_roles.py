@@ -393,19 +393,29 @@ class AdminRoleTests(unittest.TestCase):
             "SELECT COUNT(*) FROM otp_verifications WHERE user_id=?",
             (issued_user_ids[0],),
         ).fetchone()[0]
+        audit_log = conn.execute(
+            "SELECT user_id FROM audit_logs WHERE action=? AND details=?",
+            (
+                "USER_REGISTERED_PENDING",
+                "Mail Failure started email verification.",
+            ),
+        ).fetchone()
         conn.close()
         self.assertEqual(remaining_otps, 0)
+        self.assertIsNotNone(audit_log)
+        self.assertIsNone(audit_log["user_id"])
 
-    def test_registration_sends_gmail_otp_and_verification_activates_user(self):
-        email = f"gmail-{self.id().lower()}@example.test"
+    def test_registration_sends_brevo_otp_and_verification_activates_user(self):
+        email = f"brevo-{self.id().lower()}@example.test"
+        api_key = self.main.secrets.token_urlsafe(32)
         with (
             patch.object(self.main, "AuthController", RealAuthController),
             patch.dict(
                 os.environ,
                 {
-                    "MAIL_USERNAME": "onboarding@resend.dev",
-                    "RESEND_TEST_EMAIL": email,
-                    "RESEND_API_KEY": "test-resend-key",
+                    "BREVO_API_KEY": api_key,
+                    "BREVO_SENDER_EMAIL": "fajardoej15@gmail.com",
+                    "BREVO_SENDER_NAME": "FindIt Pasig City Lost and Found",
                 },
             ),
             patch.object(self.main.urllib.request, "urlopen") as urlopen,
@@ -415,7 +425,7 @@ class AdminRoleTests(unittest.TestCase):
             response = self.client.post(
                 "/register",
                 data={
-                    "full_name": "Resend Test",
+                    "full_name": "Brevo Test",
                     "email": email,
                     "password": "Password123",
                     "confirm_password": "Password123",
@@ -428,21 +438,27 @@ class AdminRoleTests(unittest.TestCase):
         self.assertTrue(response.location.endswith("/verify-otp"))
         urlopen.assert_called_once()
         api_request = urlopen.call_args.args[0]
-        self.assertEqual(api_request.full_url, "https://api.resend.com/emails")
+        self.assertEqual(
+            api_request.full_url,
+            "https://api.brevo.com/v3/smtp/email",
+        )
         self.assertEqual(api_request.get_method(), "POST")
-        self.assertEqual(api_request.get_header("Authorization"), "Bearer test-resend-key")
+        self.assertTrue(api_request.get_header("Api-key"))
         self.assertEqual(urlopen.call_args.kwargs, {"timeout": 20})
         payload = json.loads(api_request.data)
         self.assertEqual(
-            payload["from"],
-            '"FindIt: Pasig City Lost & Found" <onboarding@resend.dev>',
+            payload["sender"],
+            {
+                "name": "FindIt Pasig City Lost and Found",
+                "email": "fajardoej15@gmail.com",
+            },
         )
-        self.assertEqual(payload["to"], [email])
+        self.assertEqual(payload["to"], [{"email": email, "name": "Brevo Test"}])
         self.assertEqual(
             payload["subject"],
             "FindIt: Pasig City Lost & Found - Email Verification",
         )
-        self.assertIn("123456", payload["text"])
+        self.assertIn("123456", payload["textContent"])
         user = self.account(email)
         self.assertEqual(user["account_status"], "PENDING")
         conn = database.get_connection()
@@ -458,61 +474,42 @@ class AdminRoleTests(unittest.TestCase):
         self.assertEqual(verification.location, "/login")
         self.assertEqual(self.account(email)["account_status"], "ACTIVE")
 
-    def test_resend_testing_domain_blocks_non_configured_registration_recipient(self):
-        email = f"not-allowed-{self.id().lower()}@example.test"
-        with (
-            patch.object(self.main, "AuthController", RealAuthController),
-            patch.dict(
-                os.environ,
-                {
-                    "MAIL_USERNAME": "onboarding@resend.dev",
-                    "RESEND_TEST_EMAIL": "resend-owner@example.test",
-                    "RESEND_API_KEY": "test-resend-key",
-                },
-            ),
-            patch.object(self.main.urllib.request, "urlopen") as urlopen,
-        ):
-            response = self.client.post(
-                "/register",
-                data={
-                    "full_name": "Restricted Recipient",
-                    "email": email,
-                    "password": "Password123",
-                    "confirm_password": "Password123",
-                    "security_question": "What is your favorite city?",
-                    "security_answer": "Pasig",
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(
-            b"Email verification is currently limited to the configured testing email address.",
-            response.data,
-        )
-        self.assertNotIn(b"resend-owner@example.test", response.data)
-        urlopen.assert_not_called()
-        self.assertIsNone(self.account(email))
-
-    def test_resend_testing_domain_without_configured_recipient_does_not_call_api(self):
+    def test_brevo_http_error_does_not_expose_api_key_or_otp(self):
+        api_key = self.main.secrets.token_urlsafe(32)
+        code = "712834"
         with (
             patch.dict(
                 os.environ,
                 {
-                    "MAIL_USERNAME": "onboarding@resend.dev",
-                    "RESEND_TEST_EMAIL": "",
-                    "RESEND_API_KEY": "test-resend-key",
+                    "BREVO_API_KEY": api_key,
+                    "BREVO_SENDER_EMAIL": "fajardoej15@gmail.com",
+                    "BREVO_SENDER_NAME": "FindIt Pasig City Lost and Found",
                 },
             ),
-            patch.object(self.main.urllib.request, "urlopen") as urlopen,
+            patch.object(
+                self.main.urllib.request,
+                "urlopen",
+                side_effect=self.main.urllib.error.HTTPError(
+                    "https://api.brevo.com/v3/smtp/email",
+                    401,
+                    "Unauthorized",
+                    {},
+                    None,
+                ),
+            ),
+            self.assertLogs(self.main.app.name, level="ERROR") as captured,
         ):
             result = self.main.send_otp_email(
                 "somebody@example.test",
                 "Test User",
-                "123456",
+                code,
             )
 
         self.assertFalse(result)
-        urlopen.assert_not_called()
+        log_output = "\n".join(captured.output)
+        self.assertIn("http_status=401", log_output)
+        self.assertNotIn(api_key, log_output)
+        self.assertNotIn(code, log_output)
 
     def test_incorrect_and_expired_registration_otp_do_not_activate_account(self):
         email = f"otp-check-{self.id().lower()}@example.test"

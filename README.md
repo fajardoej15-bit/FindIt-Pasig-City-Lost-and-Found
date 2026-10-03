@@ -190,6 +190,18 @@ Render Auto-Deploy
 Live Web Application
 ```
 
+### Environment configuration
+
+For local development, copy `.env.example` to `.env` and set the values there.
+Set the same variable names in Render's environment settings:
+
+- `SECRET_KEY` (required when `FLASK_DEBUG` is disabled)
+- `BREVO_API_KEY`
+- `BREVO_SENDER_EMAIL`
+- `BREVO_SENDER_NAME`
+
+Keep `.env` and the Brevo API key out of version control.
+
 ## Project Goal
 
 The goal of the Smart Lost & Found Portal is to provide Pasig City residents with a centralized and organized way to report, search, verify, claim, and resolve lost-and-found items through a web-based platform.
